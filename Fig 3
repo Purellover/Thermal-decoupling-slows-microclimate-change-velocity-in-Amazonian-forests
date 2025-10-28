@@ -1,0 +1,154 @@
+"""
+Figure 3 — Hotspot velocity roses and dominant direction analysis
+Author: Zhimin Ma (2025)
+Repository: amazon-microclimate-model
+
+Input:
+    - hotspot shapefile (hotspots.shp)
+    - velocity direction raster (°)
+    - velocity magnitude raster (km/decade)
+Output:
+    - individual rose diagrams (PDF)
+    - summary table of dominant directions (CSV)
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+import geopandas as gpd
+from rasterio.mask import mask
+from rasterio import features
+from shapely.geometry import mapping
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+
+# =====================================================
+# 1. File paths (relative to repository root)
+# =====================================================
+hotspot_shp = "Figure3_data/hotspots.shp"
+dir_raster  = "Figure3_data/Tmacro_direction_10km.tif"
+vel_raster  = "Figure3_data/Tmacro_velocity_ssp245_10km.tif"
+output_dir  = "outputs/Fig3_velocity_roses/"
+os.makedirs(output_dir, exist_ok=True)
+
+# =====================================================
+# 2. Custom color map (velocity magnitude scale)
+# =====================================================
+custom_colors = [
+    '#2c7c9f', '#66c2a5', '#c7e9b4', '#ffffcc',
+    '#ffeda0', '#feb24c', '#fc4e2a', '#e31a1c', '#bd0026'
+]
+cmap = ListedColormap(custom_colors)
+boundaries = np.arange(1, 10 + 1, 1)
+norm = BoundaryNorm(boundaries, cmap.N)
+
+plt.rcParams['font.family'] = 'DejaVu Sans'
+
+# =====================================================
+# 3. Polar rose plotting function
+# =====================================================
+def plot_rose_count_colored_by_velocity(direction, magnitude, bins=16, title=""):
+    """Plot a rose diagram showing pixel count per direction, colored by mean velocity."""
+    mask = (~np.isnan(direction)) & (~np.isnan(magnitude))
+    theta = np.deg2rad(direction[mask])
+    values = magnitude[mask]
+
+    counts, bin_edges = np.histogram(theta, bins=bins)
+    total_vel, _ = np.histogram(theta, bins=bin_edges, weights=values)
+    avg_vel = total_vel / (counts + 1e-6)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    colors = cmap(norm(avg_vel))
+
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={'polar': True})
+    ax.bar(bin_centers, counts, width=(2*np.pi)/bins, color=colors, edgecolor='black', alpha=0.9)
+    ax.set_theta_zero_location('N')
+    ax.set_theta_direction(-1)
+
+    r = ax.get_rmax() + 1
+    for angle, label in zip([0, np.pi/2, np.pi, 3*np.pi/2], ['N', 'W', 'S', 'E']):
+        ax.text(angle, r, label, ha='center', va='center', fontsize=14, fontweight='bold')
+
+    ax.set_title(title, va='bottom', fontsize=16)
+    return fig, ax
+
+# =====================================================
+# 4. Load hotspot polygons and rasters
+# =====================================================
+gdf = gpd.read_file(hotspot_shp)
+with rasterio.open(dir_raster) as dir_src, rasterio.open(vel_raster) as vel_src:
+    for idx, row in gdf.iterrows():
+        geometry = [row.geometry]
+        out_dir, _ = mask(dir_src, geometry, crop=True)
+        out_vel, _ = mask(vel_src, geometry, crop=True)
+        dir_data = out_dir[0].astype(float)
+        vel_data = out_vel[0].astype(float)
+
+        fig, ax = plot_rose_count_colored_by_velocity(
+            direction=dir_data,
+            magnitude=vel_data,
+            bins=16,
+            title=f"Hotspot {idx+1}"
+        )
+
+        fig.savefig(
+            os.path.join(output_dir, f"rose_hotspot_{idx+1}.pdf"),
+            dpi=300, bbox_inches='tight', format='pdf'
+        )
+        plt.close(fig)
+
+print(f"✅ Rose diagrams saved to: {output_dir}")
+
+# =====================================================
+# 5. Dominant direction extraction
+# =====================================================
+def extract_dir_vel(geom, direction_data, velocity_data, transform):
+    """Extract all pixel values of direction and velocity within a geometry."""
+    mask = features.geometry_mask([mapping(geom)], direction_data.shape, transform, invert=True)
+    return direction_data[mask], velocity_data[mask]
+
+def get_main_direction_info(direction, velocity, bins=16):
+    """Return dominant direction range, center, pixel count, and mean velocity."""
+    mask = (~np.isnan(direction)) & (~np.isnan(velocity))
+    if mask.sum() == 0:
+        return {"main_direction_range": np.nan, "main_direction_center": np.nan,
+                "pixel_count": 0, "avg_velocity_km_decade": np.nan}
+    direction = direction[mask]
+    velocity = velocity[mask]
+
+    theta = np.deg2rad(direction)
+    counts, bin_edges = np.histogram(theta, bins=bins)
+    total_velocity, _ = np.histogram(theta, bins=bin_edges, weights=velocity)
+    avg_velocity = total_velocity / (counts + 1e-6)
+
+    main_idx = np.argmax(counts)
+    bin_start, bin_end = np.rad2deg(bin_edges[main_idx]), np.rad2deg(bin_edges[main_idx+1])
+    bin_center = (bin_start + bin_end) / 2
+
+    return {
+        "main_direction_range": f"{bin_start:.1f}°–{bin_end:.1f}°",
+        "main_direction_center": round(bin_center, 1),
+        "pixel_count": int(counts[main_idx]),
+        "avg_velocity_km_decade": round(float(avg_velocity[main_idx]), 3)
+    }
+
+# =====================================================
+# 6. Compute dominant direction per hotspot
+# =====================================================
+results = []
+with rasterio.open(dir_raster) as dir_src, rasterio.open(vel_raster) as vel_src:
+    direction_data = dir_src.read(1)
+    velocity_data = vel_src.read(1)
+    transform = dir_src.transform
+    crs = dir_src.crs
+
+    gdf = gdf.to_crs(crs)
+    for idx, row in gdf.iterrows():
+        dir_vals, vel_vals = extract_dir_vel(row.geometry, direction_data, velocity_data, transform)
+        info = get_main_direction_info(dir_vals, vel_vals)
+        info["hotspot_id"] = idx + 1
+        results.append(info)
+
+df_results = pd.DataFrame(results)
+df_results.to_csv(os.path.join(output_dir, "dominant_direction_summary.csv"), index=False)
+print("✅ Dominant direction summary saved.")
