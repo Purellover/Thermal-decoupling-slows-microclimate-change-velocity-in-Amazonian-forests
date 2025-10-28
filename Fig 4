@@ -1,0 +1,167 @@
+"""
+Figure 4 — Identification of thermal refugia and stability hotspots
+Author: Zhimin Ma (2025)
+
+Description:
+    This script identifies core and buffer refugia based on four stability
+    criteria derived from temperature trends, velocity, and thermal cluster
+    transitions across three time periods (Past–Mid–Future).
+
+Criteria:
+    C1 — Low velocity (< 2 km/decade)
+    C2 — Positive microclimate buffering (T_macro – T_micro > 0)
+    C3 — Consistent cluster change direction (trend coherence)
+    C4 — Limited thermal regime shift (≤ 2 cluster levels)
+
+Output:
+    - Core and buffer masks
+    - Labeled refugia patches (GeoTIFF)
+    - Vectorized and filtered refugia polygons (GeoPackage)
+"""
+
+import os
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, Resampling
+from rasterio.features import shapes
+import geopandas as gpd
+from shapely.geometry import shape
+from shapely.ops import unary_union
+from scipy.ndimage import label
+import pandas as pd
+
+# =====================================================
+# 1. Input file paths (relative to repository root)
+# =====================================================
+tmicro_trend_path   = "Figure4_data/Tmicro_trend.tif"
+tmacro_trend_path   = "Figure4_data/Tmacro_trend.tif"
+tmicro_velocity_path = "Figure4_data/Tmicro_velocity.tif"
+
+cluster_past_path   = "Figure4_data/kmeans_past.tif"
+cluster_mid_path    = "Figure4_data/kmeans_mid.tif"
+cluster_future_path = "Figure4_data/kmeans_future.tif"
+
+output_dir = "outputs/Fig4_refugia/"
+os.makedirs(output_dir, exist_ok=True)
+
+# =====================================================
+# 2. Helper: read raster
+# =====================================================
+def read_raster(path):
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype(float)
+        return arr, src.profile, src.transform, src.crs
+
+tmicro_trend, profile, transform, crs = read_raster(tmicro_trend_path)
+tmacro_trend, _, _, _ = read_raster(tmacro_trend_path)
+tmicro_velocity, _, _, _ = read_raster(tmicro_velocity_path)
+cluster_past, _, _, _ = read_raster(cluster_past_path)
+cluster_mid, _, _, _ = read_raster(cluster_mid_path)
+cluster_future, _, _, _ = read_raster(cluster_future_path)
+
+# =====================================================
+# 3. Remap cluster labels for ordered temperature regimes
+# =====================================================
+def remap_cluster_labels(cluster_array, remap_dict):
+    remapped = np.full_like(cluster_array, np.nan)
+    for old_label, new_label in remap_dict.items():
+        remapped[cluster_array == old_label] = new_label
+    return remapped.astype(np.uint8)
+
+# Example remap dictionary (adjust as needed)
+remap_dict = {0:0, 7:1, 3:2, 1:3, 6:4, 4:5, 5:6, 2:7}
+cluster_past = remap_cluster_labels(cluster_past, remap_dict)
+cluster_mid = remap_cluster_labels(cluster_mid, remap_dict)
+cluster_future = remap_cluster_labels(cluster_future, remap_dict)
+
+# =====================================================
+# 4. Define stability criteria (C1–C4)
+# =====================================================
+velocity_threshold = 2.0
+C1 = tmicro_velocity < velocity_threshold                           # low velocity
+C2 = (tmacro_trend - tmicro_trend) > 0                              # buffering
+trend1 = cluster_mid - cluster_past
+trend2 = cluster_future - cluster_mid
+C3 = (np.sign(trend1) == np.sign(trend2)) & (trend1 != 0) & (trend2 != 0)  # consistent direction
+max_change = np.max(np.abs(np.stack([trend1, trend2])), axis=0)
+C4 = max_change <= 2                                                # limited shift
+
+# =====================================================
+# 5. Combine masks
+# =====================================================
+core_mask   = C1 & C2 & C3 & C4
+buffer_mask = C1 & C2 & C4
+buffer_only_mask = buffer_mask & (~core_mask)
+
+def mask_stats(mask, name, valid_mask):
+    """Print pixel count, area, and percentage."""
+    pix = np.count_nonzero(mask)
+    total = np.count_nonzero(valid_mask)
+    pct = 100 * pix / total if total > 0 else 0
+    print(f"{name:<18}: {pix:,d} pixels ({pct:.2f}%)")
+    return pix
+
+valid_mask = ~np.isnan(tmicro_velocity)
+mask_stats(core_mask,   "Core refugia",   valid_mask)
+mask_stats(buffer_mask, "Buffer refugia", valid_mask)
+mask_stats(buffer_only_mask, "Buffer-only", valid_mask)
+
+# =====================================================
+# 6. Label connected refugia patches
+# =====================================================
+structure = np.ones((3, 3), dtype=int)  # 8-neighbor connectivity
+labeled, n_patches = label(core_mask, structure=structure)
+print(f"Connected patches identified: {n_patches}")
+
+profile.update(dtype="int32", count=1, nodata=0)
+labeled_path = os.path.join(output_dir, "core_refugia_labeled.tif")
+with rasterio.open(labeled_path, "w", **profile) as dst:
+    dst.write(labeled.astype(np.int32), 1)
+print(f"Labeled refugia map saved → {labeled_path}")
+
+# =====================================================
+# 7. Convert labeled raster to vector polygons
+# =====================================================
+with rasterio.open(labeled_path) as src:
+    labeled_array = src.read(1)
+    transform = src.transform
+    crs = src.crs
+
+records = (
+    {"geometry": shape(geom), "patch_id": int(val)}
+    for geom, val in shapes(
+        labeled_array.astype(np.int32),
+        mask=(labeled_array > 0),
+        transform=transform
+    )
+)
+gdf = gpd.GeoDataFrame.from_records(records, crs=crs)
+gdf = gdf.dissolve(by="patch_id").reset_index(drop=True)
+
+# =====================================================
+# 8. Post-process polygons (buffering & filtering)
+# =====================================================
+gdf_proj = gdf.to_crs(epsg=5880)               # update to region-specific UTM
+gdf_proj["geometry"] = gdf_proj.buffer(1000)   # expand 1 km
+merged = unary_union(gdf_proj.geometry)
+merged_gdf = gpd.GeoDataFrame(
+    geometry=list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged],
+    crs=gdf_proj.crs
+)
+merged_gdf["geometry"] = merged_gdf.buffer(-1000)  # contract back
+
+merged_gdf["area_km2"] = merged_gdf.area / 1e6
+merged_gdf["perimeter_m"] = merged_gdf.length
+merged_gdf["shape_index"] = merged_gdf["perimeter_m"] / merged_gdf.area
+
+filtered = merged_gdf[
+    (merged_gdf["area_km2"] >= 50) & (merged_gdf["shape_index"] <= 0.06)
+].copy()
+print(f"Final refugia polygons retained: {len(filtered)}")
+
+# =====================================================
+# 9. Export results
+# =====================================================
+gdf_out = os.path.join(output_dir, "core_refugia_filtered.gpkg")
+filtered.to_file(gdf_out, driver="GPKG")
+print(f"Refugia polygons exported → {gdf_out}")
