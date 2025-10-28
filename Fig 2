@@ -1,0 +1,175 @@
+"""
+Figure 2: Temperature Regime Migration — Sankey Diagram
+Author: Zhimin Ma (2025)
+
+Input:
+    - precomputed cluster features and labels for Past, Mid, and Future periods
+      (e.g., outputs from temperature clustering analysis)
+    - cluster count and mapping consistency across periods
+
+Output:
+    - Interactive Plotly Sankey diagram (displayed or saved as PDF/PNG)
+"""
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from sklearn.metrics import silhouette_score
+
+# =====================================================
+# 1. Build DataFrames for three periods
+# =====================================================
+def build_df(features, labels, period_name):
+    """Construct DataFrame containing Tmin, Tmax, Range, Tmean, and cluster labels."""
+    df = pd.DataFrame(features, columns=["Tmin", "Tmax", "Range"])
+    df["Tmean"] = (df["Tmin"] + df["Tmax"]) / 2
+    df["cluster"] = labels
+    df["period"] = period_name
+    return df
+
+# Example placeholders: replace with your actual arrays
+# past_features, mid_features, future_features = ...
+# past_cluster_labels, mid_cluster_labels, future_cluster_labels = ...
+
+df_past = build_df(past_features, past_cluster_labels, "Past")
+df_mid = build_df(mid_features, mid_cluster_labels, "Mid")
+df_future = build_df(future_features, future_cluster_labels, "Future")
+
+df_all = pd.concat([df_past, df_mid, df_future], ignore_index=True)
+
+# =====================================================
+# 2. Sort clusters by mean Tmean within each period
+# =====================================================
+order_past = df_past.groupby("cluster")["Tmean"].mean().sort_values().index.tolist()
+order_mid = df_mid.groupby("cluster")["Tmean"].mean().sort_values().index.tolist()
+order_future = df_future.groupby("cluster")["Tmean"].mean().sort_values().index.tolist()
+
+cluster_map_past = {orig: i for i, orig in enumerate(order_past)}
+cluster_map_mid = {orig: i for i, orig in enumerate(order_mid)}
+cluster_map_future = {orig: i for i, orig in enumerate(order_future)}
+
+df_all["cluster_sorted"] = df_all.apply(
+    lambda row: (
+        cluster_map_past[row["cluster"]] if row["period"] == "Past"
+        else cluster_map_mid[row["cluster"]] if row["period"] == "Mid"
+        else cluster_map_future[row["cluster"]]
+    ),
+    axis=1
+)
+
+# =====================================================
+# 3. Combine corresponding rows (Past–Mid–Future)
+# =====================================================
+df_past_sorted = df_past.copy()
+df_mid_sorted = df_mid.copy()
+df_future_sorted = df_future.copy()
+
+df_past_sorted["cluster_sorted"] = df_past_sorted["cluster"].map(cluster_map_past)
+df_mid_sorted["cluster_sorted"] = df_mid_sorted["cluster"].map(cluster_map_mid)
+df_future_sorted["cluster_sorted"] = df_future_sorted["cluster"].map(cluster_map_future)
+
+df_past_sorted.reset_index(drop=True, inplace=True)
+df_mid_sorted.reset_index(drop=True, inplace=True)
+df_future_sorted.reset_index(drop=True, inplace=True)
+
+df_merged = pd.DataFrame({
+    "past_cluster": df_past_sorted["cluster_sorted"],
+    "mid_cluster": df_mid_sorted["cluster_sorted"],
+    "future_cluster": df_future_sorted["cluster_sorted"]
+})
+
+# =====================================================
+# 4. Compute transition counts
+# =====================================================
+past_mid_counts = df_merged.groupby(["past_cluster", "mid_cluster"]).size().to_dict()
+mid_future_counts = df_merged.groupby(["mid_cluster", "future_cluster"]).size().to_dict()
+
+# =====================================================
+# 5. Define temperature cluster labels
+# =====================================================
+temp_labels = [
+    "Very Low Temp", "Low Temp", "Mid-Low Temp", "Mid Temp",
+    "Mid-High Temp", "High Temp", "Very High Temp", "Extreme Temp"
+]
+n_clusters = len(temp_labels)
+
+# =====================================================
+# 6. Compute total counts for normalization
+# =====================================================
+past_totals = defaultdict(int)
+for (p, m), count in past_mid_counts.items():
+    past_totals[p] += count
+
+mid_totals = defaultdict(int)
+for (m, f), count in mid_future_counts.items():
+    mid_totals[m] += count
+
+# =====================================================
+# 7. Build Sankey links (filter by ratio threshold)
+# =====================================================
+threshold_ratio = 0.04  # retain transitions ≥4% of source total
+
+sources, targets, values = [], [], []
+
+# Past → Mid
+for (p, m), count in past_mid_counts.items():
+    ratio = count / past_totals[p]
+    if ratio >= threshold_ratio:
+        sources.append(p)
+        targets.append(m + n_clusters)
+        values.append(count)
+
+# Mid → Future
+for (m, f), count in mid_future_counts.items():
+    ratio = count / mid_totals[m]
+    if ratio >= threshold_ratio:
+        sources.append(m + n_clusters)
+        targets.append(f + 2 * n_clusters)
+        values.append(count)
+
+# =====================================================
+# 8. Define node labels and colors
+# =====================================================
+cluster_colors = ["#4575b4", "#74add1", "#abd9e9", "#e0f3f8",
+                  "#fee090", "#fdae61", "#f46d43", "#d73027"]
+
+labels = (
+    [f"Past-{lbl}" for lbl in temp_labels] +
+    [f"Mid-{lbl}" for lbl in temp_labels] +
+    [f"Future-{lbl}" for lbl in temp_labels]
+)
+
+node_colors = [cluster_colors[i % n_clusters] for _ in range(3) for i in range(n_clusters)]
+link_colors = [cluster_colors[int(s) % n_clusters] for s in sources]
+
+# =====================================================
+# 9. Plot Sankey diagram
+# =====================================================
+fig = go.Figure(go.Sankey(
+    node=dict(
+        pad=15,
+        thickness=20,
+        line=dict(color="black", width=0.5),
+        label=[""] * len(labels),  # hide node labels for cleaner figure
+        color=node_colors
+    ),
+    link=dict(
+        source=sources,
+        target=targets,
+        value=values,
+        color=link_colors
+    )
+))
+
+fig.update_layout(
+    title_text="Temperature Cluster Migration (Past–Mid–Future)",
+    font_size=12,
+    width=900,
+    height=600
+)
+
+# Save or display the figure
+# fig.write_image("Figure2_Temperature_Sankey.pdf", engine="kaleido", scale=2)
+fig.show()
