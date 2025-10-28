@@ -1,0 +1,188 @@
+"""
+Figure 1d–i: Relationships between ΔT (T_macro − T_micro) and biophysical factors
+Author: Zhimin Ma (2025)
+
+Data:
+    All input raster files should be placed in the `Figure1_data/` directory.
+    Due to file size limitations, example or subset rasters can be used for testing.
+"""
+
+import rasterio
+import numpy as np
+from rasterio.warp import reproject, Resampling
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# =====================================================
+# 1. Load reference raster (Trend difference, SSP245)
+# =====================================================
+trend_diff_path = 'Figure1_data/Trend_difference_ssp245.tif'
+
+with rasterio.open(trend_diff_path) as src:
+    diff_data = src.read(1).astype(np.float32)
+    ref_meta = src.meta.copy()
+    target_transform = src.transform
+    target_crs = src.crs
+    target_width = src.width
+    target_height = src.height
+
+# =====================================================
+# 2. Function: reproject & align rasters to reference
+# =====================================================
+def align_raster(src_array, src_meta, target_transform, target_crs, target_width, target_height, resampling=Resampling.nearest):
+    """Reproject and resample a raster to match reference grid."""
+    dst = np.empty((target_height, target_width), dtype=src_array.dtype)
+    reproject(
+        source=src_array,
+        destination=dst,
+        src_transform=src_meta['transform'],
+        src_crs=src_meta['crs'],
+        dst_transform=target_transform,
+        dst_crs=target_crs,
+        resampling=resampling
+    )
+    return dst
+
+def read_and_align_raster(path, target_transform, target_crs, target_width, target_height):
+    """Read a raster and align it to the reference projection."""
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype(np.float32)
+        meta = src.meta.copy()
+        return align_raster(arr, meta, target_transform, target_crs, target_width, target_height)
+
+# =====================================================
+# 3. Input paths for biophysical variables (SSP245)
+# =====================================================
+lai_path  = 'Figure1_data/LAI_Decadal_Average_2013_2022.tif'
+elev_path = 'Figure1_data/elevation.tif'
+ch_path   = 'Figure1_data/CH_Amazon.tif'
+prep_path = 'Figure1_data/MeanPrecip_ssp245.tif'
+rsds_path = 'Figure1_data/MeanRSDS_ssp245.tif'
+vpd_path  = 'Figure1_data/MeanVPD_ssp245.tif'
+
+# =====================================================
+# 4. Read and align all environmental factors
+# =====================================================
+lai   = read_and_align_raster(lai_path, target_transform, target_crs, target_width, target_height)
+elev  = read_and_align_raster(elev_path, target_transform, target_crs, target_width, target_height)
+ch    = read_and_align_raster(ch_path, target_transform, target_crs, target_width, target_height)
+prep  = read_and_align_raster(prep_path, target_transform, target_crs, target_width, target_height)
+rsds  = read_and_align_raster(rsds_path, target_transform, target_crs, target_width, target_height)
+vpd   = read_and_align_raster(vpd_path, target_transform, target_crs, target_width, target_height)
+
+# =====================================================
+# 5. Reclassification of continuous variables (6 bins)
+# =====================================================
+def reclassify(arr, bins):
+    """Generic helper to reclassify continuous data into ordinal bins."""
+    classified = np.full(arr.shape, np.nan)
+    for i, (low, high) in enumerate(bins, 1):
+        if high is None:
+            classified[arr >= low] = i
+        else:
+            classified[(arr >= low) & (arr < high)] = i
+    return classified
+
+lai_bins   = [(0,3),(3,4),(4,4.5),(4.5,5),(5,6),(6,None)]
+ch_bins    = [(0,15),(15,20),(20,25),(25,30),(30,35),(35,None)]
+elev_bins  = [(0,50),(50,100),(100,200),(200,300),(300,400),(400,None)]
+prep_bins  = [(0,100),(100,150),(150,200),(200,250),(250,300),(300,None)]
+rsds_bins  = [(0,190),(190,200),(200,210),(210,220),(220,230),(230,None)]
+vpd_bins   = [(0,0.4),(0.4,0.6),(0.6,0.8),(0.8,1.0),(1.0,1.2),(1.2,None)]
+
+lai_class   = reclassify(lai, lai_bins)
+ch_class    = reclassify(ch, ch_bins)
+elev_class  = reclassify(elev, elev_bins)
+prep_class  = reclassify(prep, prep_bins)
+rsds_class  = reclassify(rsds, rsds_bins)
+vpd_class   = reclassify(vpd, vpd_bins)
+
+# =====================================================
+# 6. Create DataFrames for plotting
+# =====================================================
+def create_df(diff_array, class_array, labels, var_name):
+    """Flatten and merge ΔT and classification arrays into DataFrame."""
+    diff_flat = diff_array.flatten()
+    class_flat = class_array.flatten()
+    mask = ~np.isnan(diff_flat) & ~np.isnan(class_flat)
+    df = pd.DataFrame({
+        "ΔT (°C/year)": diff_flat[mask],
+        var_name: pd.Categorical([labels[int(c)] for c in class_flat[mask]], categories=labels.values(), ordered=True)
+    })
+    return df
+
+def label_dict(intervals, fmt):
+    """Create label dictionary (1-based keys)."""
+    out = {}
+    for i, (low, high) in enumerate(intervals, 1):
+        if high is None:
+            out[i] = f">{low:g}"
+        else:
+            out[i] = f"{low:{fmt}}–{high:{fmt}}"
+    return out
+
+labels = {
+    "LAI": label_dict(lai_bins, ".1f"),
+    "CH": label_dict(ch_bins, ".0f"),
+    "Elevation (m)": label_dict(elev_bins, ".0f"),
+    "Precipitation (mm/mo)": label_dict(prep_bins, ".0f"),
+    "RSDS (W/m²)": label_dict(rsds_bins, ".0f"),
+    "VPD (kPa)": label_dict(vpd_bins, ".1f")
+}
+
+dfs = {
+    "LAI": create_df(diff_data, lai_class, labels["LAI"], "LAI"),
+    "CH": create_df(diff_data, ch_class, labels["CH"], "CH"),
+    "Elevation (m)": create_df(diff_data, elev_class, labels["Elevation (m)"], "Elevation (m)"),
+    "Precipitation (mm/mo)": create_df(diff_data, prep_class, labels["Precipitation (mm/mo)"], "Precipitation (mm/mo)"),
+    "RSDS (W/m²)": create_df(diff_data, rsds_class, labels["RSDS (W/m²)"], "RSDS (W/m²)"),
+    "VPD (kPa)": create_df(diff_data, vpd_class, labels["VPD (kPa)"], "VPD (kPa)")
+}
+
+# =====================================================
+# 7. Remove outliers (2–98 percentile per class)
+# =====================================================
+def filter_by_percentile(df, group_col, value_col="ΔT (°C/year)", lower=0.02, upper=0.98):
+    """Remove outliers by percentile thresholds within each class."""
+    def _filt(g):
+        ql, qh = g[value_col].quantile([lower, upper])
+        return g[(g[value_col] >= ql) & (g[value_col] <= qh)]
+    return df.groupby(group_col, group_keys=False).apply(_filt).reset_index(drop=True)
+
+for k in dfs:
+    dfs[k] = filter_by_percentile(dfs[k], k)
+
+# =====================================================
+# 8. Plot boxplots (Fig. 1d–i)
+# =====================================================
+palettes = {
+    "LAI": sns.color_palette("Greens", 6),
+    "CH": sns.color_palette("BuGn", 6),
+    "Elevation (m)": sns.color_palette("YlOrBr", 6),
+    "Precipitation (mm/mo)": sns.color_palette("Blues", 6),
+    "RSDS (W/m²)": sns.color_palette("YlOrRd", 6),
+    "VPD (kPa)": sns.color_palette("Purples", 6)
+}
+
+fig, axes = plt.subplots(2, 3, figsize=(22, 10))
+axes = axes.flatten()
+
+for ax, (var, df) in zip(axes, dfs.items()):
+    sns.boxplot(
+        x=var,
+        y="ΔT (°C/year)",
+        data=df,
+        palette=palettes[var],
+        showfliers=False,
+        ax=ax
+    )
+    ax.set_title(var, fontsize=18)
+    ax.set_xlabel("")
+    ax.set_ylabel("ΔT (°C/year)", fontsize=15)
+    ax.tick_params(axis="x", rotation=30, labelsize=13)
+    ax.tick_params(axis="y", labelsize=13)
+
+plt.tight_layout()
+# plt.savefig("Figure1_d_i_DeltaT_vs_factors_ssp585.pdf", dpi=300)
+plt.show()
