@@ -1,0 +1,367 @@
+"""
+Velocity computation workflow
+
+This script computes:
+  1) horizontal spatial gradients (magnitude and direction) from a single raster
+     using a 3×3 window and latitude-dependent distance corrections;
+  2) temporal trends (slope, intercept, p-value) per pixel from a stack
+     of decadal rasters;
+  3) climate-change velocity as the ratio between temporal trend and
+     spatial gradient.
+
+The implementation is designed as a transparent reference for the
+velocity calculations used in the manuscript.
+
+Dependencies:
+    - numpy
+    - scipy
+    - rasterio
+    - pandas (optional, for bookkeeping)
+"""
+
+import os
+import math
+import numpy as np
+import rasterio
+from rasterio.warp import Resampling
+from scipy.stats import linregress
+
+
+# =====================================================
+# 1. Spatial gradient computation (3×3 window)
+# =====================================================
+
+def calculate_average_max_gradient_and_direction(window, resolution_x, resolution_y, lat_center):
+    """
+    Compute horizontal gradient using an "average of maximum" formulation
+    within a 3×3 window.
+
+    Formulas:
+      d_x = ( (z(i-1,j+1)-z(i-1,j-1))/(2*w1)
+            + (z(i,  j+1)-z(i,  j-1))/w2
+            + (z(i+1,j+1)-z(i+1,j-1))/(2*w3) ) / 4
+
+      d_y = ( (z(i+1,j-1)-z(i-1,j-1))/(2*h)
+            + (z(i+1,j  )-z(i-1,j  ))/h
+            + (z(i+1,j+1)-z(i-1,j+1))/(2*h) ) / 4
+
+      g_h = sqrt(d_x^2 + d_y^2)
+      d_h = atan2(d_y, d_x) in degrees
+
+    where:
+      w_n = resolution_x * 111.325 * cos(radians(phi_n))  (km in longitude),
+      phi_n are representative latitudes for top, middle and bottom rows,
+      h   = resolution_y * 111.352  (km in latitude).
+
+    Parameters
+    ----------
+    window : np.ndarray
+        3×3 array containing the focal cell and its 8 neighbors.
+    resolution_x : float
+        Pixel size in degrees along longitude.
+    resolution_y : float
+        Pixel size in degrees along latitude.
+    lat_center : float
+        Latitude (degrees) of the focal pixel.
+
+    Returns
+    -------
+    grad_mag : float
+        Gradient magnitude (units of Z per km).
+    grad_dir : float
+        Gradient direction in degrees, from arctan2(d_y, d_x).
+    """
+    center = window[1, 1]
+    if np.isnan(center):
+        return np.nan, np.nan
+
+    # Representative latitudes for the three rows
+    lat_top = lat_center + resolution_y
+    lat_mid = lat_center
+    lat_bot = lat_center - resolution_y
+
+    # Distances in km along longitude
+    w1 = resolution_x * 111.325 * math.cos(math.radians(lat_top))
+    w2 = resolution_x * 111.325 * math.cos(math.radians(lat_mid))
+    w3 = resolution_x * 111.325 * math.cos(math.radians(lat_bot))
+
+    # Distance in km along latitude
+    h = resolution_y * 111.352
+
+    # East–west gradients
+    d_x_top = (window[0, 2] - window[0, 0]) / (2 * w1)
+    d_x_mid = (window[1, 2] - window[1, 0]) / w2
+    d_x_bot = (window[2, 2] - window[2, 0]) / (2 * w3)
+    d_x = (d_x_top + d_x_mid + d_x_bot) / 4.0
+
+    # South–north gradients
+    d_y_left = (window[2, 0] - window[0, 0]) / (2 * h)
+    d_y_mid = (window[2, 1] - window[0, 1]) / h
+    d_y_right = (window[2, 2] - window[0, 2]) / (2 * h)
+    d_y = (d_y_left + d_y_mid + d_y_right) / 4.0
+
+    grad_mag = np.sqrt(d_x ** 2 + d_y ** 2)
+    grad_dir = np.degrees(np.arctan2(d_y, d_x))
+
+    return grad_mag, grad_dir
+
+
+def compute_spatial_gradient(
+    input_file,
+    output_gradient_file,
+    output_direction_file,
+    noise_range=(-0.05, 0.05),
+):
+    """
+    Compute spatial gradient magnitude and direction from a single raster.
+
+    Parameters
+    ----------
+    input_file : str
+        Path to the input raster (e.g. climatological mean temperature).
+    output_gradient_file : str
+        Path to the output raster for gradient magnitude.
+    output_direction_file : str
+        Path to the output raster for gradient direction (degrees).
+    noise_range : tuple of float
+        Uniform noise range added to the input field to avoid
+        artifacts in perfectly flat areas.
+    """
+    with rasterio.open(input_file) as src:
+        data = src.read(1).astype(float)
+        transform = src.transform
+        resolution_x = abs(transform[0])
+        resolution_y = abs(transform[4])
+
+        # Use upper bound as reference latitude (rows decrease in latitude)
+        lat_reference = src.bounds.top
+        meta = src.meta.copy()
+
+    # Add small random noise to avoid infinite gradients in flat regions
+    data_with_noise = data + np.random.uniform(
+        noise_range[0], noise_range[1], data.shape
+    )
+
+    rows, cols = data.shape
+    grad_mag = np.full_like(data, np.nan, dtype=float)
+    grad_dir = np.full_like(data, np.nan, dtype=float)
+
+    for row in range(1, rows - 1):
+        # Approximate latitude of the focal row
+        lat_center = lat_reference - (row * resolution_y)
+        for col in range(1, cols - 1):
+            window = data_with_noise[row - 1 : row + 2, col - 1 : col + 2]
+            g_h, d_h = calculate_average_max_gradient_and_direction(
+                window=window,
+                resolution_x=resolution_x,
+                resolution_y=resolution_y,
+                lat_center=lat_center,
+            )
+            grad_mag[row, col] = g_h
+            grad_dir[row, col] = d_h
+
+    meta.update(dtype="float32", nodata=np.nan, count=1)
+
+    # Write gradient magnitude
+    with rasterio.open(output_gradient_file, "w", **meta) as dst:
+        dst.write(grad_mag.astype(np.float32), 1)
+
+    # Write gradient direction
+    with rasterio.open(output_direction_file, "w", **meta) as dst:
+        dst.write(grad_dir.astype(np.float32), 1)
+
+
+# =====================================================
+# 2. Temporal trend (slope, intercept, p-value)
+# =====================================================
+
+def compute_temporal_trend(
+    input_folder,
+    time_points,
+    output_folder,
+    file_suffix=".tif",
+    nodata_value=-9999.0,
+):
+    """
+    Compute temporal linear trends per pixel from a stack of rasters.
+
+    Parameters
+    ----------
+    input_folder : str
+        Folder containing decadal rasters (e.g. 2028, 2038, ..., 2096).
+    time_points : array-like
+        Time coordinate for each raster (e.g. central year of each decade).
+    output_folder : str
+        Target folder for slope, intercept and p-value rasters.
+    file_suffix : str
+        File suffix for rasters (default: '.tif').
+    nodata_value : float
+        No-data value written to output rasters.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+
+    raster_files = sorted(
+        [
+            os.path.join(input_folder, f)
+            for f in os.listdir(input_folder)
+            if f.endswith(file_suffix)
+        ]
+    )
+
+    if len(raster_files) != len(time_points):
+        raise ValueError(
+            f"Number of rasters ({len(raster_files)}) does not match "
+            f"number of time points ({len(time_points)})."
+        )
+
+    raster_data = []
+    meta = None
+
+    for i, raster_path in enumerate(raster_files):
+        with rasterio.open(raster_path) as src:
+            arr = src.read(1).astype(float)
+            arr[arr == src.nodata] = np.nan
+            raster_data.append(arr)
+            if meta is None:
+                meta = src.meta.copy()
+
+    stack = np.stack(raster_data, axis=0)  # (time, rows, cols)
+    _, rows, cols = stack.shape
+
+    slopes = np.full((rows, cols), np.nan, dtype=float)
+    intercepts = np.full((rows, cols), np.nan, dtype=float)
+    p_values = np.full((rows, cols), np.nan, dtype=float)
+
+    skipped_pixels = 0
+    time_points = np.asarray(time_points, dtype=float)
+
+    for i in range(rows):
+        for j in range(cols):
+            y = stack[:, i, j]
+            if np.all(np.isnan(y)):
+                skipped_pixels += 1
+                continue
+
+            slope, intercept, r_value, p_value, std_err = linregress(time_points, y)
+            slopes[i, j] = slope
+            intercepts[i, j] = intercept
+            p_values[i, j] = p_value
+
+    print(f"Skipped {skipped_pixels} pixels with all NaN time series.")
+
+    meta.update(dtype="float32", nodata=nodata_value, count=1)
+
+    with rasterio.open(os.path.join(output_folder, "slopes.tif"), "w", **meta) as dst:
+        dst.write(slopes.astype("float32"), 1)
+
+    with rasterio.open(os.path.join(output_folder, "intercepts.tif"), "w", **meta) as dst:
+        dst.write(intercepts.astype("float32"), 1)
+
+    with rasterio.open(os.path.join(output_folder, "p_values.tif"), "w", **meta) as dst:
+        dst.write(p_values.astype("float32"), 1)
+
+    print(f"Temporal trend rasters written to: {output_folder}")
+
+
+# =====================================================
+# 3. Climate-change velocity
+# =====================================================
+
+def compute_climate_velocity(
+    time_gradient_file,
+    spatial_gradient_file,
+    output_file,
+    min_gradient_threshold=1e-6,
+):
+    """
+    Compute climate-change velocity as the ratio of temporal trend to
+    spatial gradient.
+
+    Parameters
+    ----------
+    time_gradient_file : str
+        Path to raster of temporal trend (e.g. slope in °C per decade).
+    spatial_gradient_file : str
+        Path to raster of spatial gradient magnitude (e.g. °C per km).
+    output_file : str
+        Path to output velocity raster (km per decade).
+    min_gradient_threshold : float
+        Threshold to avoid division by zero or extremely small gradients.
+    """
+    with rasterio.open(time_gradient_file) as src_t:
+        time_gradient = src_t.read(1).astype(float)
+        time_meta = src_t.meta.copy()
+        time_gradient[time_gradient == src_t.nodata] = np.nan
+
+    with rasterio.open(spatial_gradient_file) as src_s:
+        spatial_gradient = src_s.read(1).astype(float)
+        spatial_gradient[spatial_gradient == src_s.nodata] = np.nan
+
+    climate_velocity = np.full_like(time_gradient, np.nan, dtype=float)
+
+    valid_mask = (
+        (spatial_gradient > 0)
+        & ~np.isnan(time_gradient)
+        & ~np.isnan(spatial_gradient)
+    )
+
+    # Avoid division by zero or very small gradients
+    safe_spatial = np.where(
+        spatial_gradient > min_gradient_threshold,
+        spatial_gradient,
+        np.nan,
+    )
+
+    climate_velocity[valid_mask] = time_gradient[valid_mask] / safe_spatial[valid_mask]
+
+    time_meta.update(dtype="float32", nodata=np.nan, count=1)
+
+    with rasterio.open(output_file, "w", **time_meta) as dst:
+        dst.write(climate_velocity.astype("float32"), 1)
+
+    print(f"Climate velocity raster written to: {output_file}")
+
+
+# =====================================================
+# 4. Example usage (can be commented out in the repo)
+# =====================================================
+
+if __name__ == "__main__":
+    # Example paths (adapt to your repository structure)
+    spatial_input = "velocity_inputs/mean_temperature_baseline.tif"
+    spatial_grad_out = "velocity_outputs/spatial_gradient.tif"
+    spatial_dir_out = "velocity_outputs/spatial_direction.tif"
+
+    temporal_folder = "velocity_inputs/decadal_mean_temperature/"
+    temporal_out_folder = "velocity_outputs/temporal_trend/"
+
+    # Central years for each decadal raster (example)
+    time_points = [2028, 2038, 2048, 2058, 2068, 2078, 2088, 2096]
+
+    velocity_out = "velocity_outputs/climate_velocity.tif"
+
+    # 1) Spatial gradient
+    compute_spatial_gradient(
+        input_file=spatial_input,
+        output_gradient_file=spatial_grad_out,
+        output_direction_file=spatial_dir_out,
+        noise_range=(-0.05, 0.05),
+    )
+
+    # 2) Temporal trend
+    compute_temporal_trend(
+        input_folder=temporal_folder,
+        time_points=time_points,
+        output_folder=temporal_out_folder,
+        file_suffix=".tif",
+        nodata_value=-9999.0,
+    )
+
+    # 3) Climate-change velocity
+    time_slope_file = os.path.join(temporal_out_folder, "slopes.tif")
+    compute_climate_velocity(
+        time_gradient_file=time_slope_file,
+        spatial_gradient_file=spatial_grad_out,
+        output_file=velocity_out,
+        min_gradient_threshold=1e-6,
+    )
