@@ -1,11 +1,21 @@
 """
-Figure 1d–i: Relationships between ΔT (T_macro − T_micro) and biophysical factors
-Author: Zhimin Ma (2025)
+Figure 1d–i – Relationships between ΔT (T_macro − T_micro) and biophysical factors
 
-Data:
-    All input raster files should be placed in the `Figure1_data/` directory.
-    Due to file size limitations, example or subset rasters can be used for testing.
+This script samples co-registered raster layers and computes the relationship
+between forest temperature decoupling ΔT (T_macro − T_micro) and biophysical
+predictors for Figure 1d–i.
+
+Inputs:
+    - A raster of ΔT (e.g. 'Figure1_data/Trend_difference_ssp245.tif'
+      or other temperature-decoupling metric)
+    - Co-registered rasters of biophysical variables stored in
+      the 'Figure1_data/' directory (e.g. LAI, canopy height, topography)
+
+Outputs:
+    - Tabular samples suitable for plotting (CSV)
+    - Pairwise plots or regression diagnostics (e.g. PNG/PDF)
 """
+
 
 import rasterio
 import numpy as np
