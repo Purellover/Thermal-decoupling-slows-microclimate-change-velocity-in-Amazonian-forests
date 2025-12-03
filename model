@@ -1,3 +1,17 @@
+"""
+This repository contains code for modelling monthly understory microclimate temperature using gradient-boosted trees (XGBoost).  
+The workflow implements:
+
+1. Data preprocessing (NA removal, target-based quantile filtering)
+2. Leave-sensor-out validation
+3. Leave-site-out validation
+4. Hyperparameter tuning with K-fold cross-validation
+5. Training and saving a final XGBoost model
+
+The code is designed to be fully reproducible and to serve as a transparent reference implementation for microclimate–macroclimate modelling.
+"""
+
+
 import argparse
 import math
 import os
