@@ -1,16 +1,19 @@
 """
-Figure 3 — Hotspot velocity roses and dominant direction analysis
-Author: Zhimin Ma (2025)
-Repository: amazon-microclimate-model
+Figure 3 – Hotspot velocity roses and dominant direction analysis
 
-Input:
-    - hotspot shapefile (hotspots.shp)
-    - velocity direction raster (°)
-    - velocity magnitude raster (km/decade)
-Output:
+This script generates velocity rose diagrams and a summary of dominant
+movement directions for climate-change velocity hotspots.
+
+Inputs:
+    - hotspot shapefile (e.g. "Figure3_data/hotspots.shp")
+    - velocity direction raster (degrees, e.g. "Figure3_data/Tmacro_direction_10km.tif")
+    - velocity magnitude raster (km per decade, e.g. "Figure3_data/Tmacro_velocity_ssp245_10km.tif")
+
+Outputs:
     - individual rose diagrams (PDF)
     - summary table of dominant directions (CSV)
 """
+
 
 import os
 import numpy as np
