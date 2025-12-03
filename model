@@ -1,0 +1,340 @@
+import argparse
+import math
+import os
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.model_selection import KFold, GridSearchCV, train_test_split
+import xgboost as xgb
+
+def preprocess_data(
+    csv_path,
+    target_col="tem3",
+    lower_q=0.02,
+    upper_q=0.98,
+    bad_sensors=None,
+):
+    """
+    Load and preprocess data:
+      1) drop NA
+      2) remove extreme values based on quantiles of target
+      3) remove known problematic sensors (if provided)
+    """
+    df = pd.read_csv(csv_path)
+    df = df.dropna()
+
+    # remove extreme values
+    lower = df[target_col].quantile(lower_q)
+    upper = df[target_col].quantile(upper_q)
+    df = df[(df[target_col] >= lower) & (df[target_col] <= upper)]
+
+    # remove problematic sensors if provided
+    if bad_sensors is not None and len(bad_sensors) > 0:
+        bad_sensors_str = [str(s) for s in bad_sensors]
+        df = df[~df["number"].astype(str).isin(bad_sensors_str)]
+
+    return df.reset_index(drop=True)
+
+
+def leave_sensor_out_validation(
+    df,
+    features,
+    target,
+    sites,
+    sensors_per_site=4,
+    n_repeats=5,
+    min_sensors=8,
+    base_random_state=42,
+):
+    """
+    Leave-sensor-out validation.
+    For each site and each repeat:
+      - randomly select 'sensors_per_site' sensors as validation
+      - train on remaining sensors within the same site
+    """
+    results = []
+
+    for repeat in range(n_repeats):
+        for site in sites:
+            site_df = df[df["ID"] == site]
+            sensors = site_df["number"].astype(str).unique()
+
+            if len(sensors) < min_sensors:
+                print(f"[LSO] Site {site} has only {len(sensors)} sensors, skip.")
+                continue
+
+            rng = np.random.RandomState(base_random_state + repeat)
+            val_sensors = rng.choice(sensors, size=sensors_per_site, replace=False)
+
+            train_df = site_df[~site_df["number"].astype(str).isin(val_sensors)]
+            valid_df = site_df[site_df["number"].astype(str).isin(val_sensors)]
+
+            if train_df.empty or valid_df.empty:
+                print(f"[LSO] Site {site} has empty train/valid split, skip.")
+                continue
+
+            X_train = train_df[features].values
+            y_train = train_df[target].values
+            X_valid = valid_df[features].values
+            y_valid = valid_df[target].values
+
+            model = xgb.XGBRegressor(
+                objective="reg:squarederror",
+                random_state=base_random_state + repeat,
+            )
+            model.fit(X_train, y_train)
+
+            y_pred = model.predict(X_valid)
+            mse = mean_squared_error(y_valid, y_pred)
+            rmse = math.sqrt(mse)
+            mae = mean_absolute_error(y_valid, y_pred)
+            r2 = r2_score(y_valid, y_pred)
+
+            results.append(
+                {
+                    "Scheme": "leave-sensor-out",
+                    "Iteration": repeat + 1,
+                    "Site": site,
+                    "MSE": mse,
+                    "RMSE": rmse,
+                    "MAE": mae,
+                    "R2": r2,
+                    "n_train": len(train_df),
+                    "n_valid": len(valid_df),
+                }
+            )
+
+    return pd.DataFrame(results)
+
+def leave_sensor_out_validation_once(
+    df,
+    features,
+    target,
+    sites,
+    sensors_per_site=4,
+    min_sensors=8,
+    random_state=42,
+):
+    """
+    Deterministic leave-sensor-out validation:
+      - For each site, randomly select fixed 'sensors_per_site' sensors
+      - Train on the remaining sensors
+      - Validate on the selected sensors
+      - Only run once
+    """
+    results = []
+
+    for site in sites:
+        site_df = df[df["ID"] == site]
+        sensors = site_df["number"].astype(str).unique()
+
+        if len(sensors) < min_sensors:
+            print(f"[LSO] Site {site} has only {len(sensors)} sensors, skip.")
+            continue
+
+        rng = np.random.RandomState(random_state)
+        val_sensors = rng.choice(sensors, size=sensors_per_site, replace=False)
+
+        train_df = site_df[~site_df["number"].astype(str).isin(val_sensors)]
+        valid_df = site_df[site_df["number"].astype(str).isin(val_sensors)]
+
+        X_train = train_df[features].values
+        y_train = train_df[target].values
+        X_valid = valid_df[features].values
+        y_valid = valid_df[target].values
+
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror",
+            random_state=random_state,
+        )
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_valid)
+
+        mse = mean_squared_error(y_valid, y_pred)
+        rmse = math.sqrt(mse)
+        mae = mean_absolute_error(y_valid, y_pred)
+        r2 = r2_score(y_valid, y_pred)
+
+        results.append({
+            "Scheme": "leave-sensor-out",
+            "Site": site,
+            "MSE": mse,
+            "RMSE": rmse,
+            "MAE": mae,
+            "R2": r2,
+            "n_train": len(train_df),
+            "n_valid": len(valid_df),
+        })
+
+    return pd.DataFrame(results)
+
+def tune_final_model(
+    df,
+    features,
+    target,
+    param_grid=None,
+    test_size=0.2,
+    random_state=42,
+    n_splits=5,
+):
+    """
+    Tune XGBoost hyperparameters using K-fold CV on the training set,
+    then evaluate on a held-out test set and return the best model.
+    """
+    X = df[features].values
+    y = df[target].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state
+    )
+
+    if param_grid is None:
+        param_grid = {
+            "n_estimators": [100, 200],
+            "max_depth": [3, 6],
+            "learning_rate": [0.05, 0.1],
+            "subsample": [0.8, 1.0],
+            "colsample_bytree": [0.8, 1.0],
+            "gamma": [0, 0.1],
+        }
+
+    base_model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        random_state=random_state,
+    )
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=param_grid,
+        cv=kf,
+        scoring="neg_mean_squared_error",
+        n_jobs=-1,
+        verbose=1,
+    )
+
+    grid_search.fit(X_train, y_train)
+    best_model = grid_search.best_estimator_
+
+    y_pred = best_model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = math.sqrt(mse)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    print("Best parameters from grid search:")
+    print(grid_search.best_params_)
+    print("Held-out test performance:")
+    print(f"  RMSE = {rmse:.3f}")
+    print(f"  MAE  = {mae:.3f}")
+    print(f"  R2   = {r2:.3f}")
+
+    return best_model, grid_search.best_params_
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Microclimate XGBoost model with leave-sensor-out, "
+            "leave-site-out validation and final hyperparameter tuning."
+        )
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="data/all_data_monthly_mean2.csv",
+        help="Path to the input CSV file.",
+    )
+    parser.add_argument(
+        "--model-out",
+        type=str,
+        default="models/best_xgb_mean2.pkl",
+        help="Path to save the final tuned XGBoost model.",
+    )
+    args = parser.parse_args()
+
+    # Load and preprocess data (no bad_sensors filter)
+    df = preprocess_data(
+        csv_path=args.csv,
+        target_col="tem3",
+        lower_q=0.02,
+        upper_q=0.98,
+        bad_sensors=None,     # 保持接口一致，但已经不再使用删坏传感器功能
+    )
+
+    features = [
+        "Rainfall",
+        "SRAD",
+        "CH",
+        "VPD",
+        "LAI",
+        "elevation",
+        "aspect",
+        "slope",
+        "Tem_air",
+    ]
+    target = "tem3"
+
+    sites = sorted(df["ID"].unique())
+    print("Sites in dataset:", sites)
+    print("Total samples after preprocessing:", len(df))
+
+    # 1) Leave-sensor-out validation (single deterministic run)
+    print("\nRunning leave-sensor-out validation...")
+    lso_results = leave_sensor_out_validation_once(
+        df=df,
+        features=features,
+        target=target,
+        sites=sites,
+        sensors_per_site=4,
+        min_sensors=8,
+        random_state=42,
+    )
+    print("\nLeave-sensor-out summary:")
+    print(
+        lso_results[["Site", "RMSE", "MAE", "R2"]]
+        .set_index("Site")
+        .sort_index()
+    )
+
+    # 2) Leave-site-out validation (single deterministic run)
+    print("\nRunning leave-one-site-out validation...")
+    loso_results = leave_site_out_validation_once(
+        df=df,
+        features=features,
+        target=target,
+        sites=sites,
+        random_state=123,
+    )
+    print("\nLeave-one-site-out summary:")
+    print(
+        loso_results[["Test_Site", "RMSE", "MAE", "R2"]]
+        .set_index("Test_Site")
+        .sort_index()
+    )
+
+    # 3) Final model tuning on all data
+    print("\nTuning final XGBoost model with grid search...")
+    best_model, best_params = tune_final_model(
+        df=df,
+        features=features,
+        target=target,
+        test_size=0.2,
+        random_state=42,
+        n_splits=5,
+    )
+
+    # 4) Save final model
+    model_dir = os.path.dirname(args.model_out)
+    if model_dir:
+        os.makedirs(model_dir, exist_ok=True)
+    joblib.dump(best_model, args.model_out)
+    print(f"\nFinal model saved to: {args.model_out}")
+    print("Best hyperparameters:", best_params)
+
+if __name__ == "__main__":
+    main()
