@@ -1,15 +1,20 @@
 """
-Figure 2: Temperature Regime Migration — Sankey Diagram
-Author: Zhimin Ma (2025)
+Figure 2 – Temperature Regime Migration (Sankey Diagram)
 
-Input:
-    - precomputed cluster features and labels for Past, Mid, and Future periods
-      (e.g., outputs from temperature clustering analysis)
-    - cluster count and mapping consistency across periods
+This script visualizes transitions among temperature-regime clusters
+across Past, Mid, and Future periods using a Sankey diagram.
 
-Output:
-    - Interactive Plotly Sankey diagram (displayed or saved as PDF/PNG)
+Inputs:
+    - pre-computed cluster features and labels for each period
+      (e.g. results from the temperature-clustering workflow)
+    - a consistent number of clusters and a stable mapping scheme
+      across temporal periods
+
+Outputs:
+    - interactive Plotly Sankey diagram
+    - optional export as PDF or PNG
 """
+
 
 import numpy as np
 import pandas as pd
