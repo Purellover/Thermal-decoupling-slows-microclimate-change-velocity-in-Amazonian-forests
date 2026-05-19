@@ -33,12 +33,16 @@ warnings.filterwarnings("ignore")
 # Configuration
 # ---------------------------------------------------------------------
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_DIR / "data"
+OUTPUT_DIR = PROJECT_DIR / "outputs"
+
 CONFIG = {
-    "fig3_dir": Path(r"E:/Paper_2_new/Fig_3"),
-    "fig4_dir": Path(r"E:/Paper_2_new/Fig_4"),
-    "pa_dir": Path(r"E:/Paper_2_new/Fig_4/Pa_shp"),
-    "output_dir": Path(r"E:/Paper_2_new/Fig_4/output"),
-    "amazon_shape": Path(r"E:/Paper_2_new/shp/amazon_bio.shp"),
+    "fig3_dir": DATA_DIR / "fig3",
+    "fig4_dir": DATA_DIR / "fig4",
+    "pa_dir": DATA_DIR / "fig4" / "protected_areas",
+    "output_dir": OUTPUT_DIR / "fig4",
+    "amazon_shape": DATA_DIR / "shapefiles" / "amazon_bio.shp",
     "projected_crs": "EPSG:5880",
     "scenarios": ["ssp245", "ssp585"],
     "scenario_labels": {"ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"},
