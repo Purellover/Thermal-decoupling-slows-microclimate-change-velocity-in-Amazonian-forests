@@ -33,12 +33,16 @@ warnings.filterwarnings("ignore")
 # Configuration
 # ---------------------------------------------------------------------
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_DIR / "data"
+OUTPUT_DIR = PROJECT_DIR / "outputs"
+
 CONFIG = {
-    "fig1_dir": Path(r"E:/Paper_2_new/Fig_1"),
-    "shape_file": Path(r"E:/Paper_2_new/shp/amazon_bio.shp"),
-    "output_dir": Path(r"E:/Paper_2_new/Fig_1"),
-    "terrain_dir": Path(r"E:/Paper_2_new/terrain_structure_data"),
-    "baseline_dir": Path(r"E:/Paper_2_new/historical_baseline"),
+    "fig1_dir": DATA_DIR / "fig1",
+    "shape_file": DATA_DIR / "shapefiles" / "amazon_bio.shp",
+    "output_dir": OUTPUT_DIR / "fig1",
+    "terrain_dir": DATA_DIR / "terrain_structure_data",
+    "baseline_dir": DATA_DIR / "historical_baseline",
     "scenarios": ["ssp245", "ssp585"],
     "scenario_labels": {"ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"},
     "sites": {
