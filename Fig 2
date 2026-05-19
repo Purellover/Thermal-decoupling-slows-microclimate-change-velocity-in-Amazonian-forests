@@ -36,11 +36,15 @@ warnings.filterwarnings("ignore")
 # Configuration
 # ---------------------------------------------------------------------
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_DIR / "data"
+OUTPUT_DIR = PROJECT_DIR / "outputs"
+
 CONFIG = {
-    "tmax_dir": Path(r"E:/Paper_2_new/prediction_annual_mean_tmax"),
-    "tmin_dir": Path(r"E:/Paper_2_new/prediction_annual_mean_tmin"),
-    "output_dir": Path(r"E:/Paper_2_new/Fig_2"),
-    "shape_file": Path(r"E:/Paper_2_new/shp/amazon_bio.shp"),
+    "tmax_dir": DATA_DIR / "prediction_annual_mean_tmax",
+    "tmin_dir": DATA_DIR / "prediction_annual_mean_tmin",
+    "output_dir": OUTPUT_DIR / "fig2",
+    "shape_file": DATA_DIR / "shapefiles" / "amazon_bio.shp",
     "scenarios": ["ssp245", "ssp585"],
     "scenario_labels": {"ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"},
     "n_clusters": 8,
