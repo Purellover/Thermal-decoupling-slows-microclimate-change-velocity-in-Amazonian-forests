@@ -1,180 +1,413 @@
+#!/usr/bin/env python3
 """
-Figure 2 – Temperature Regime Migration (Sankey Diagram)
+Figure 2. Microclimate regime classification and regime transitions.
 
-This script visualizes transitions among temperature-regime clusters
-across Past, Mid, and Future periods using a Sankey diagram.
+Workflow
+1. Read decadal Tmax and Tmin rasters.
+2. Average them into historical, mid-century and late-century periods.
+3. Fit k-means to the historical baseline only.
+4. Assign future pixels to the same historical cluster centroids.
+5. Plot maps, a Sankey diagram and thermal characteristics of the historical regimes.
 
-Inputs:
-    - pre-computed cluster features and labels for each period
-      (e.g. results from the temperature-clustering workflow)
-    - a consistent number of clusters and a stable mapping scheme
-      across temporal periods
-
-Outputs:
-    - interactive Plotly Sankey diagram
-    - optional export as PDF or PNG
+This fixed historical reference avoids label switching across periods.
+Update the paths in CONFIG before running.
 """
 
+from pathlib import Path
+import warnings
 
+import geopandas as gpd
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from collections import defaultdict
-import matplotlib.pyplot as plt
-from sklearn.metrics import silhouette_score
+import rasterio
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from PIL import Image
+from scipy.stats import linregress
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
-# =====================================================
-# 1. Build DataFrames for three periods
-# =====================================================
-def build_df(features, labels, period_name):
-    """Construct DataFrame containing Tmin, Tmax, Range, Tmean, and cluster labels."""
-    df = pd.DataFrame(features, columns=["Tmin", "Tmax", "Range"])
-    df["Tmean"] = (df["Tmin"] + df["Tmax"]) / 2
-    df["cluster"] = labels
-    df["period"] = period_name
-    return df
+warnings.filterwarnings("ignore")
 
-# Example placeholders: replace with your actual arrays
-# past_features, mid_features, future_features = ...
-# past_cluster_labels, mid_cluster_labels, future_cluster_labels = ...
 
-df_past = build_df(past_features, past_cluster_labels, "Past")
-df_mid = build_df(mid_features, mid_cluster_labels, "Mid")
-df_future = build_df(future_features, future_cluster_labels, "Future")
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-df_all = pd.concat([df_past, df_mid, df_future], ignore_index=True)
+CONFIG = {
+    "tmax_dir": Path(r"E:/Paper_2_new/prediction_annual_mean_tmax"),
+    "tmin_dir": Path(r"E:/Paper_2_new/prediction_annual_mean_tmin"),
+    "output_dir": Path(r"E:/Paper_2_new/Fig_2"),
+    "shape_file": Path(r"E:/Paper_2_new/shp/amazon_bio.shp"),
+    "scenarios": ["ssp245", "ssp585"],
+    "scenario_labels": {"ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"},
+    "n_clusters": 8,
+    "random_state": 42,
+    "sankey_threshold": 0.04,
+    "past_decades": ["1980s", "1990s", "2000s", "2010s"],
+    "mid_decades": ["2020s", "2030s", "2040s", "2050s"],
+    "future_decades": ["2060s", "2070s", "2080s", "2090s"],
+}
 
-# =====================================================
-# 2. Sort clusters by mean Tmean within each period
-# =====================================================
-order_past = df_past.groupby("cluster")["Tmean"].mean().sort_values().index.tolist()
-order_mid = df_mid.groupby("cluster")["Tmean"].mean().sort_values().index.tolist()
-order_future = df_future.groupby("cluster")["Tmean"].mean().sort_values().index.tolist()
+CLUSTER_COLORS = [
+    "#4575b4", "#74add1", "#abd9e9", "#e0f3f8",
+    "#fee090", "#fdae61", "#f46d43", "#d73027",
+]
 
-cluster_map_past = {orig: i for i, orig in enumerate(order_past)}
-cluster_map_mid = {orig: i for i, orig in enumerate(order_mid)}
-cluster_map_future = {orig: i for i, orig in enumerate(order_future)}
-
-df_all["cluster_sorted"] = df_all.apply(
-    lambda row: (
-        cluster_map_past[row["cluster"]] if row["period"] == "Past"
-        else cluster_map_mid[row["cluster"]] if row["period"] == "Mid"
-        else cluster_map_future[row["cluster"]]
-    ),
-    axis=1
-)
-
-# =====================================================
-# 3. Combine corresponding rows (Past–Mid–Future)
-# =====================================================
-df_past_sorted = df_past.copy()
-df_mid_sorted = df_mid.copy()
-df_future_sorted = df_future.copy()
-
-df_past_sorted["cluster_sorted"] = df_past_sorted["cluster"].map(cluster_map_past)
-df_mid_sorted["cluster_sorted"] = df_mid_sorted["cluster"].map(cluster_map_mid)
-df_future_sorted["cluster_sorted"] = df_future_sorted["cluster"].map(cluster_map_future)
-
-df_past_sorted.reset_index(drop=True, inplace=True)
-df_mid_sorted.reset_index(drop=True, inplace=True)
-df_future_sorted.reset_index(drop=True, inplace=True)
-
-df_merged = pd.DataFrame({
-    "past_cluster": df_past_sorted["cluster_sorted"],
-    "mid_cluster": df_mid_sorted["cluster_sorted"],
-    "future_cluster": df_future_sorted["cluster_sorted"]
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 27,
+    "axes.titlesize": 30,
+    "axes.labelsize": 27,
+    "xtick.labelsize": 24,
+    "ytick.labelsize": 24,
 })
 
-# =====================================================
-# 4. Compute transition counts
-# =====================================================
-past_mid_counts = df_merged.groupby(["past_cluster", "mid_cluster"]).size().to_dict()
-mid_future_counts = df_merged.groupby(["mid_cluster", "future_cluster"]).size().to_dict()
 
-# =====================================================
-# 5. Define temperature cluster labels
-# =====================================================
-temp_labels = [
-    "Very Low Temp", "Low Temp", "Mid-Low Temp", "Mid Temp",
-    "Mid-High Temp", "High Temp", "Very High Temp", "Extreme Temp"
-]
-n_clusters = len(temp_labels)
+# ---------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------
 
-# =====================================================
-# 6. Compute total counts for normalization
-# =====================================================
-past_totals = defaultdict(int)
-for (p, m), count in past_mid_counts.items():
-    past_totals[p] += count
+def read_raster(path):
+    with rasterio.open(path) as src:
+        array = src.read(1).astype(np.float32)
+        nodata = src.nodata
+        meta = src.meta.copy()
+    if nodata is not None:
+        array[array == nodata] = np.nan
+    array[array <= -9990] = np.nan
+    return array, meta
 
-mid_totals = defaultdict(int)
-for (m, f), count in mid_future_counts.items():
-    mid_totals[m] += count
 
-# =====================================================
-# 7. Build Sankey links (filter by ratio threshold)
-# =====================================================
-threshold_ratio = 0.04  # retain transitions ≥4% of source total
+def mean_raster(paths):
+    arrays = []
+    meta = None
+    for path in paths:
+        array, this_meta = read_raster(path)
+        arrays.append(array)
+        if meta is None:
+            meta = this_meta
+    return np.nanmean(np.stack(arrays, axis=0), axis=0), meta
 
-sources, targets, values = [], [], []
 
-# Past → Mid
-for (p, m), count in past_mid_counts.items():
-    ratio = count / past_totals[p]
-    if ratio >= threshold_ratio:
-        sources.append(p)
-        targets.append(m + n_clusters)
-        values.append(count)
+def save_label_raster(labels, mask, shape, reference_meta, out_path):
+    full = np.full(shape[0] * shape[1], -1, dtype=np.int16)
+    full[mask] = labels.astype(np.int16)
 
-# Mid → Future
-for (m, f), count in mid_future_counts.items():
-    ratio = count / mid_totals[m]
-    if ratio >= threshold_ratio:
-        sources.append(m + n_clusters)
-        targets.append(f + 2 * n_clusters)
-        values.append(count)
+    meta = reference_meta.copy()
+    meta.update(dtype="int16", count=1, nodata=-1)
 
-# =====================================================
-# 8. Define node labels and colors
-# =====================================================
-cluster_colors = ["#4575b4", "#74add1", "#abd9e9", "#e0f3f8",
-                  "#fee090", "#fdae61", "#f46d43", "#d73027"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_path, "w", **meta) as dst:
+        dst.write(full.reshape(shape), 1)
 
-labels = (
-    [f"Past-{lbl}" for lbl in temp_labels] +
-    [f"Mid-{lbl}" for lbl in temp_labels] +
-    [f"Future-{lbl}" for lbl in temp_labels]
-)
 
-node_colors = [cluster_colors[i % n_clusters] for _ in range(3) for i in range(n_clusters)]
-link_colors = [cluster_colors[int(s) % n_clusters] for s in sources]
+def extract_periods(variable_dir, scenario, variable_name):
+    past_paths = [variable_dir / f"Annual_Mean_Historical_{variable_name}_{d}.tif"
+                  for d in CONFIG["past_decades"]]
+    mid_paths = [variable_dir / f"Annual_Mean_{variable_name.capitalize()}_{scenario}_{d}.tif"
+                 for d in CONFIG["mid_decades"]]
+    future_paths = [variable_dir / f"Annual_Mean_{variable_name.capitalize()}_{scenario}_{d}.tif"
+                    for d in CONFIG["future_decades"]]
 
-# =====================================================
-# 9. Plot Sankey diagram
-# =====================================================
-fig = go.Figure(go.Sankey(
-    node=dict(
-        pad=15,
-        thickness=20,
-        line=dict(color="black", width=0.5),
-        label=[""] * len(labels),  # hide node labels for cleaner figure
-        color=node_colors
-    ),
-    link=dict(
-        source=sources,
-        target=targets,
-        value=values,
-        color=link_colors
+    past, meta = mean_raster(past_paths)
+    mid, _ = mean_raster(mid_paths)
+    future, _ = mean_raster(future_paths)
+    return past, mid, future, meta
+
+
+def order_clusters_by_historical_temperature(raw_labels, tmax, tmin):
+    mean_temp = (tmax + tmin) / 2
+    table = pd.DataFrame({"cluster": raw_labels, "mean_temp": mean_temp})
+    order = table.groupby("cluster")["mean_temp"].mean().sort_values().index.tolist()
+    return {old_label: new_label for new_label, old_label in enumerate(order)}
+
+
+def rebuild_map(labels, mask, shape):
+    full = np.full(shape[0] * shape[1], np.nan, dtype=np.float32)
+    full[mask] = labels.astype(np.float32)
+    return full.reshape(shape)
+
+
+def remove_iqr_outliers(values):
+    series = pd.Series(values).dropna()
+    q1, q3 = series.quantile(0.25), series.quantile(0.75)
+    iqr = q3 - q1
+    return series[(series >= q1 - 1.5 * iqr) & (series <= q3 + 1.5 * iqr)].values
+
+
+def make_sankey_png(df, scenario, out_png):
+    n = CONFIG["n_clusters"]
+    threshold = CONFIG["sankey_threshold"]
+
+    pm_counts = df.groupby(["past", "mid"]).size().to_dict()
+    mf_counts = df.groupby(["mid", "future"]).size().to_dict()
+    past_totals = df.groupby("past").size().to_dict()
+    mid_totals = df.groupby("mid").size().to_dict()
+    future_totals = df.groupby("future").size().to_dict()
+
+    sources, targets, values, link_colors = [], [], [], []
+
+    for (past, mid), count in pm_counts.items():
+        if count / past_totals[past] >= threshold:
+            sources.append(past)
+            targets.append(mid + n)
+            values.append(count)
+            link_colors.append(CLUSTER_COLORS[past])
+
+    for (mid, future), count in mf_counts.items():
+        if count / mid_totals[mid] >= threshold:
+            sources.append(mid + n)
+            targets.append(future + 2 * n)
+            values.append(count)
+            link_colors.append(CLUSTER_COLORS[mid])
+
+    def percentages(totals):
+        total = sum(totals.values())
+        return pd.Series(totals).reindex(range(n), fill_value=0).values / total * 100
+
+    node_labels = []
+    for pct in [percentages(past_totals), percentages(mid_totals), percentages(future_totals)]:
+        for cluster_id, value in enumerate(pct):
+            node_labels.append(f"Regime-{cluster_id} ({value:.0f}%)" if value >= 3 else "")
+
+    rgba_links = [
+        f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},0.35)"
+        for c in link_colors
+    ]
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=12,
+            thickness=30,
+            line=dict(color="white", width=0.3),
+            label=node_labels,
+            color=CLUSTER_COLORS * 3,
+        ),
+        link=dict(source=sources, target=targets, value=values, color=rgba_links),
+    ))
+
+    fig.update_layout(
+        font=dict(size=24, family="DejaVu Sans", color="black"),
+        width=900,
+        height=500,
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="white",
     )
-))
 
-fig.update_layout(
-    title_text="Temperature Cluster Migration (Past–Mid–Future)",
-    font_size=12,
-    width=900,
-    height=600
-)
+    for x, label in zip([0.05, 0.45, 0.85], ["1983–2022", "2023–2062", "2063–2100"]):
+        fig.add_annotation(x=x, y=1.05, xref="paper", yref="paper",
+                           text=f"<b>{label}</b>", showarrow=False,
+                           font=dict(size=24, color="black"))
 
-# Save or display the figure
-# fig.write_image("Figure2_Temperature_Sankey.pdf", engine="kaleido", scale=2)
-fig.show()
+    fig.write_image(out_png, scale=2)
+
+
+# ---------------------------------------------------------------------
+# Main workflow
+# ---------------------------------------------------------------------
+
+def classify_regimes(scenario):
+    tmax_past, tmax_mid, tmax_future, meta = extract_periods(CONFIG["tmax_dir"], scenario, "tmax")
+    tmin_past, tmin_mid, tmin_future, _ = extract_periods(CONFIG["tmin_dir"], scenario, "tmin")
+
+    range_past = tmax_past - tmin_past
+    range_mid = tmax_mid - tmin_mid
+    range_future = tmax_future - tmin_future
+
+    valid_mask = (
+        np.isfinite(tmax_past.ravel()) & np.isfinite(tmin_past.ravel()) & np.isfinite(range_past.ravel()) &
+        np.isfinite(tmax_mid.ravel()) & np.isfinite(tmin_mid.ravel()) & np.isfinite(range_mid.ravel()) &
+        np.isfinite(tmax_future.ravel()) & np.isfinite(tmin_future.ravel()) & np.isfinite(range_future.ravel())
+    )
+
+    def values(array):
+        return array.ravel()[valid_mask]
+
+    tx_p, tn_p, rg_p = values(tmax_past), values(tmin_past), values(range_past)
+    tx_m, tn_m, rg_m = values(tmax_mid), values(tmin_mid), values(range_mid)
+    tx_f, tn_f, rg_f = values(tmax_future), values(tmin_future), values(range_future)
+
+    features_past = np.column_stack([tx_p, tn_p, rg_p])
+    features_mid = np.column_stack([tx_m, tn_m, rg_m])
+    features_future = np.column_stack([tx_f, tn_f, rg_f])
+
+    scaler = StandardScaler()
+    past_scaled = scaler.fit_transform(features_past)
+    mid_scaled = scaler.transform(features_mid)
+    future_scaled = scaler.transform(features_future)
+
+    kmeans = KMeans(n_clusters=CONFIG["n_clusters"], init="k-means++",
+                    random_state=CONFIG["random_state"], n_init=10)
+
+    raw_past = kmeans.fit_predict(past_scaled)
+    raw_mid = kmeans.predict(mid_scaled)
+    raw_future = kmeans.predict(future_scaled)
+
+    # Use a single historical label order for all periods.
+    label_map = order_clusters_by_historical_temperature(raw_past, tx_p, tn_p)
+    labels_past = np.array([label_map[x] for x in raw_past])
+    labels_mid = np.array([label_map[x] for x in raw_mid])
+    labels_future = np.array([label_map[x] for x in raw_future])
+
+    return {
+        "tmax": (tx_p, tx_m, tx_f),
+        "tmin": (tn_p, tn_m, tn_f),
+        "range": (rg_p, rg_m, rg_f),
+        "labels": (labels_past, labels_mid, labels_future),
+        "mask": valid_mask,
+        "shape": tmax_past.shape,
+        "meta": meta,
+    }
+
+
+def plot_figure2(scenario, result):
+    output_dir = CONFIG["output_dir"] / scenario
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cluster_dir = output_dir / "cluster_tif"
+
+    labels_past, labels_mid, labels_future = result["labels"]
+    tx_p, _, _ = result["tmax"]
+    tn_p, _, _ = result["tmin"]
+    rg_p, _, _ = result["range"]
+    valid_mask = result["mask"]
+    shape = result["shape"]
+
+    save_label_raster(labels_past, valid_mask, shape, result["meta"],
+                      cluster_dir / f"kmeans_past_{scenario}.tif")
+    save_label_raster(labels_mid, valid_mask, shape, result["meta"],
+                      cluster_dir / f"kmeans_mid_{scenario}.tif")
+    save_label_raster(labels_future, valid_mask, shape, result["meta"],
+                      cluster_dir / f"kmeans_future_{scenario}.tif")
+
+    transition_df = pd.DataFrame({
+        "past": labels_past,
+        "mid": labels_mid,
+        "future": labels_future,
+    })
+    transition_df.to_csv(output_dir / f"regime_transitions_{scenario}.csv", index=False)
+
+    sankey_png = output_dir / f"sankey_{scenario}.png"
+    make_sankey_png(transition_df, scenario, sankey_png)
+
+    map_past = rebuild_map(labels_past, valid_mask, shape)
+    map_mid = rebuild_map(labels_mid, valid_mask, shape)
+    map_future = rebuild_map(labels_future, valid_mask, shape)
+
+    with rasterio.open(cluster_dir / f"kmeans_past_{scenario}.tif") as src:
+        extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
+
+    amazon_gdf = gpd.read_file(CONFIG["shape_file"]).to_crs("EPSG:4326")
+    cmap = ListedColormap(CLUSTER_COLORS)
+    norm = BoundaryNorm(np.arange(-0.5, CONFIG["n_clusters"], 1), CONFIG["n_clusters"])
+
+    fig = plt.figure(figsize=(26, 16))
+    gs_top = gridspec.GridSpec(1, 3, figure=fig, top=0.95, bottom=0.57,
+                               left=0.04, right=0.98, wspace=0.08)
+    gs_left = gridspec.GridSpec(1, 1, figure=fig, top=0.48, bottom=0.05,
+                                left=0.04, right=0.57)
+    gs_right = gridspec.GridSpec(3, 1, figure=fig, top=0.48, bottom=0.05,
+                                 left=0.70, right=0.99, hspace=0.50)
+
+    map_axes = [fig.add_subplot(gs_top[0, i]) for i in range(3)]
+    ax_d = fig.add_subplot(gs_left[0, 0])
+    box_axes = [fig.add_subplot(gs_right[i, 0]) for i in range(3)]
+
+    for ax, panel, period, data in zip(
+        map_axes,
+        ["a", "b", "c"],
+        ["1983–2022", "2023–2062", "2063–2100"],
+        [map_past, map_mid, map_future],
+    ):
+        ax.imshow(data, cmap=cmap, norm=norm, extent=extent,
+                  origin="upper", aspect="auto", interpolation="nearest")
+        amazon_gdf.boundary.plot(ax=ax, color="#111111", linewidth=0.8)
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        ax.set_xticks([-80, -70, -60, -50])
+        ax.set_xticklabels(["80°W", "70°W", "60°W", "50°W"], fontsize=29)
+        ax.set_yticks([-15, -10, -5, 0, 5])
+        ax.set_yticklabels(["15°S", "10°S", "5°S", "0°", "5°N"] if panel == "a" else [])
+        ax.tick_params(direction="in", length=3)
+        ax.text(0.03, 0.97, panel, transform=ax.transAxes,
+                fontsize=33, fontweight="bold", va="top")
+        ax.text(0.97, 0.04, period, transform=ax.transAxes,
+                fontsize=24, ha="right", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8))
+
+    cbar_ax = fig.add_axes([0.15, 0.505, 0.70, 0.018])
+    cb = fig.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=norm),
+                      cax=cbar_ax, orientation="horizontal")
+    cb.set_ticks(np.arange(CONFIG["n_clusters"]))
+    cb.set_ticklabels([str(i) for i in range(CONFIG["n_clusters"])], fontsize=29)
+    cb.set_label(f"Microclimate Regime ({CONFIG['scenario_labels'][scenario]})",
+                 fontsize=26, labelpad=6)
+    cb.ax.xaxis.set_label_position("top")
+
+    ax_d.imshow(np.array(Image.open(sankey_png)), aspect="auto")
+    ax_d.axis("off")
+    ax_d.text(0.02, 0.97, "d", transform=ax_d.transAxes,
+              fontsize=33, fontweight="bold", va="top")
+
+    box_df = pd.DataFrame({"cluster": labels_past, "Tmax": tx_p, "Tmin": tn_p, "Range": rg_p})
+    for ax, column, ylabel, panel in zip(
+        box_axes,
+        ["Tmax", "Tmin", "Range"],
+        ["Tmax (°C)", "Tmin (°C)", "Temp. Range (°C)"],
+        ["e", "f", "g"],
+    ):
+        groups = [remove_iqr_outliers(box_df.loc[box_df["cluster"] == i, column])
+                  for i in range(CONFIG["n_clusters"])]
+        bp = ax.boxplot(groups, patch_artist=True, showfliers=False, widths=0.6,
+                        medianprops=dict(color="#333333", linewidth=1.5),
+                        whiskerprops=dict(color="#555555", linewidth=1.0),
+                        capprops=dict(color="#555555", linewidth=1.0),
+                        boxprops=dict(linewidth=1.0))
+        for patch, color in zip(bp["boxes"], CLUSTER_COLORS):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.85)
+
+        medians = np.array([np.median(g) if len(g) else np.nan for g in groups])
+        means = np.array([np.mean(g) if len(g) else np.nan for g in groups])
+        x = np.arange(1, CONFIG["n_clusters"] + 1)
+
+        ok = np.isfinite(medians)
+        if ok.sum() >= 2:
+            slope, intercept, _, p_value, _ = linregress(x[ok], medians[ok])
+            ax.plot(x, slope * x + intercept, color="#333333", linewidth=1.5,
+                    linestyle="-" if p_value < 0.05 else "--",
+                    label=f"p={'<0.001' if p_value < 0.001 else f'{p_value:.3f}'}")
+        ax.scatter(x, means, s=25, marker="s", color="#555555", zorder=5, label="mean")
+        ax.legend(fontsize=23, loc="upper left", framealpha=0.7, ncol=2)
+
+        ax.set_ylabel(ylabel, fontsize=26, labelpad=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(i - 1) for i in x] if panel == "g" else [], fontsize=29)
+        if panel == "g":
+            ax.set_xlabel("Microclimate Regime", fontsize=26)
+        ax.tick_params(direction="in", length=3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="y", alpha=0.25, linestyle="--")
+        ax.text(-0.18, 1.04, panel, transform=ax.transAxes,
+                fontsize=33, fontweight="bold", va="top")
+
+    out_pdf = CONFIG["output_dir"] / f"Fig2_{scenario.upper()}.pdf"
+    out_png = CONFIG["output_dir"] / f"Fig2_{scenario.upper()}.png"
+    fig.savefig(out_pdf, dpi=300, bbox_inches="tight")
+    fig.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out_pdf}")
+
+
+def main():
+    for scenario in CONFIG["scenarios"]:
+        result = classify_regimes(scenario)
+        plot_figure2(scenario, result)
+
+
+if __name__ == "__main__":
+    main()
