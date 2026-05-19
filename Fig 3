@@ -31,12 +31,15 @@ warnings.filterwarnings("ignore")
 # Configuration
 # ---------------------------------------------------------------------
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_DIR / "data"
+OUTPUT_DIR = PROJECT_DIR / "outputs"
+
 CONFIG = {
-    "base_dir": Path(r"E:/Paper_2_new"),
-    "fig3_dir": Path(r"E:/Paper_2_new/Fig_3"),
-    "shape_file": Path(r"E:/Paper_2_new/shp/amazon_bio.shp"),
-    "hotspot_file": Path(r"E:/Paper_2_new/shp/hotpoint.shp"),
-    "output_dir": Path(r"E:/Paper_2_new/Fig_3"),
+    "fig3_dir": DATA_DIR / "fig3",
+    "shape_file": DATA_DIR / "shapefiles" / "amazon_bio.shp",
+    "hotspot_file": DATA_DIR / "shapefiles" / "hotpoint.shp",
+    "output_dir": OUTPUT_DIR / "fig3",
     "scenarios": ["ssp245", "ssp585"],
     "scenario_labels": {"ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"},
     "velocity_min": 0,
