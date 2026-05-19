@@ -1,198 +1,327 @@
+#!/usr/bin/env python3
 """
-Figure 1d–i – Relationships between ΔT (T_macro − T_micro) and biophysical factors
+Figure 1. Warming-rate decoupling between understory microclimate and macroclimate.
 
-This script samples co-registered raster layers and computes the relationship
-between forest temperature decoupling ΔT (T_macro − T_micro) and biophysical
-predictors for Figure 1d–i.
+Workflow
+1. Read raster layers of microclimate warming rate, macroclimate warming rate and their difference.
+2. Plot spatial maps for WRmicro, WRmacro and ΔWR.
+3. Summarize ΔWR across environmental gradients using grouped boxplots.
+4. Export one figure for each scenario.
 
-Inputs:
-    - A raster of ΔT (e.g. 'Figure1_data/Trend_difference_ssp245.tif'
-      or other temperature-decoupling metric)
-    - Co-registered rasters of biophysical variables stored in
-      the 'Figure1_data/' directory (e.g. LAI, canopy height, topography)
-
-Outputs:
-    - Tabular samples suitable for plotting (CSV)
-    - Pairwise plots or regression diagnostics (e.g. PNG/PDF)
+The script assumes that all input rasters are already prepared on a common grid.
+Update the paths in CONFIG before running.
 """
 
+from pathlib import Path
+import warnings
 
-import rasterio
-import numpy as np
-from rasterio.warp import reproject, Resampling
-import pandas as pd
+import geopandas as gpd
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
+import numpy as np
+import rasterio
 import seaborn as sns
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from rasterio.warp import Resampling, reproject
+from scipy import stats
 
-# =====================================================
-# 1. Load reference raster (Trend difference, SSP245)
-# =====================================================
-trend_diff_path = 'Figure1_data/Trend_difference_ssp245.tif'
+warnings.filterwarnings("ignore")
 
-with rasterio.open(trend_diff_path) as src:
-    diff_data = src.read(1).astype(np.float32)
-    ref_meta = src.meta.copy()
-    target_transform = src.transform
-    target_crs = src.crs
-    target_width = src.width
-    target_height = src.height
 
-# =====================================================
-# 2. Function: reproject & align rasters to reference
-# =====================================================
-def align_raster(src_array, src_meta, target_transform, target_crs, target_width, target_height, resampling=Resampling.nearest):
-    """Reproject and resample a raster to match reference grid."""
-    dst = np.empty((target_height, target_width), dtype=src_array.dtype)
-    reproject(
-        source=src_array,
-        destination=dst,
-        src_transform=src_meta['transform'],
-        src_crs=src_meta['crs'],
-        dst_transform=target_transform,
-        dst_crs=target_crs,
-        resampling=resampling
-    )
-    return dst
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-def read_and_align_raster(path, target_transform, target_crs, target_width, target_height):
-    """Read a raster and align it to the reference projection."""
+CONFIG = {
+    "fig1_dir": Path(r"E:/Paper_2_new/Fig_1"),
+    "shape_file": Path(r"E:/Paper_2_new/shp/amazon_bio.shp"),
+    "output_dir": Path(r"E:/Paper_2_new/Fig_1"),
+    "terrain_dir": Path(r"E:/Paper_2_new/terrain_structure_data"),
+    "baseline_dir": Path(r"E:/Paper_2_new/historical_baseline"),
+    "scenarios": ["ssp245", "ssp585"],
+    "scenario_labels": {"ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"},
+    "sites": {
+        "mc1a": (-59.870, -2.404),
+        "mc1b": (-60.098, -2.338),
+        "mc2": (-64.997, -3.525),
+        "mc3": (-61.017, 1.469),
+        "mc4": (-54.958, -2.857),
+        "mc5": (-58.253, -9.823),
+        "mc7a": (-52.683, 4.081),
+        "mc7b": (-52.929, 5.282),
+    },
+}
+
+CMAP_MICRO = LinearSegmentedColormap.from_list(
+    "micro", ["#313695", "#4575b4", "#74add1", "#abd9e9",
+              "#e0f3f8", "#ffffbf", "#fee090", "#fdae61"], N=256
+)
+CMAP_MACRO = LinearSegmentedColormap.from_list(
+    "macro", ["#ffffbf", "#fee090", "#fdae61", "#f46d43",
+              "#d73027", "#a50026"], N=256
+)
+CMAP_DELTA = plt.cm.RdBu_r
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 30,
+    "axes.titlesize": 33,
+    "axes.labelsize": 30,
+    "xtick.labelsize": 27,
+    "ytick.labelsize": 27,
+    "axes.linewidth": 1.0,
+})
+
+
+# ---------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------
+
+def read_raster(path):
     with rasterio.open(path) as src:
-        arr = src.read(1).astype(np.float32)
+        array = src.read(1).astype(np.float32)
+        nodata = src.nodata
+        extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
         meta = src.meta.copy()
-        return align_raster(arr, meta, target_transform, target_crs, target_width, target_height)
+    if nodata is not None:
+        array[array == nodata] = np.nan
+    array[array <= -9990] = np.nan
+    return array, extent, meta
 
-# =====================================================
-# 3. Input paths for biophysical variables (SSP245)
-# =====================================================
-lai_path  = 'Figure1_data/LAI_Decadal_Average_2013_2022.tif'
-elev_path = 'Figure1_data/elevation.tif'
-ch_path   = 'Figure1_data/CH_Amazon.tif'
-prep_path = 'Figure1_data/MeanPrecip_ssp245.tif'
-rsds_path = 'Figure1_data/MeanRSDS_ssp245.tif'
-vpd_path  = 'Figure1_data/MeanVPD_ssp245.tif'
 
-# =====================================================
-# 4. Read and align all environmental factors
-# =====================================================
-lai   = read_and_align_raster(lai_path, target_transform, target_crs, target_width, target_height)
-elev  = read_and_align_raster(elev_path, target_transform, target_crs, target_width, target_height)
-ch    = read_and_align_raster(ch_path, target_transform, target_crs, target_width, target_height)
-prep  = read_and_align_raster(prep_path, target_transform, target_crs, target_width, target_height)
-rsds  = read_and_align_raster(rsds_path, target_transform, target_crs, target_width, target_height)
-vpd   = read_and_align_raster(vpd_path, target_transform, target_crs, target_width, target_height)
+def align_to_reference(path, ref_path):
+    """Read a raster and align it to a reference raster using bilinear resampling."""
+    with rasterio.open(ref_path) as ref:
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+        ref_shape = (ref.height, ref.width)
 
-# =====================================================
-# 5. Reclassification of continuous variables (6 bins)
-# =====================================================
-def reclassify(arr, bins):
-    """Generic helper to reclassify continuous data into ordinal bins."""
-    classified = np.full(arr.shape, np.nan)
-    for i, (low, high) in enumerate(bins, 1):
-        if high is None:
-            classified[arr >= low] = i
-        else:
-            classified[(arr >= low) & (arr < high)] = i
-    return classified
+    with rasterio.open(path) as src:
+        array = src.read(1).astype(np.float32)
+        if src.nodata is not None:
+            array[array == src.nodata] = np.nan
+        array[array <= -9990] = np.nan
 
-lai_bins   = [(0,3),(3,4),(4,4.5),(4.5,5),(5,6),(6,None)]
-ch_bins    = [(0,15),(15,20),(20,25),(25,30),(30,35),(35,None)]
-elev_bins  = [(0,50),(50,100),(100,200),(200,300),(300,400),(400,None)]
-prep_bins  = [(0,100),(100,150),(150,200),(200,250),(250,300),(300,None)]
-rsds_bins  = [(0,190),(190,200),(200,210),(210,220),(220,230),(230,None)]
-vpd_bins   = [(0,0.4),(0.4,0.6),(0.6,0.8),(0.8,1.0),(1.0,1.2),(1.2,None)]
+        if array.shape == ref_shape and src.crs == ref_crs and src.transform == ref_transform:
+            return array
 
-lai_class   = reclassify(lai, lai_bins)
-ch_class    = reclassify(ch, ch_bins)
-elev_class  = reclassify(elev, elev_bins)
-prep_class  = reclassify(prep, prep_bins)
-rsds_class  = reclassify(rsds, rsds_bins)
-vpd_class   = reclassify(vpd, vpd_bins)
-
-# =====================================================
-# 6. Create DataFrames for plotting
-# =====================================================
-def create_df(diff_array, class_array, labels, var_name):
-    """Flatten and merge ΔT and classification arrays into DataFrame."""
-    diff_flat = diff_array.flatten()
-    class_flat = class_array.flatten()
-    mask = ~np.isnan(diff_flat) & ~np.isnan(class_flat)
-    df = pd.DataFrame({
-        "ΔT (°C/year)": diff_flat[mask],
-        var_name: pd.Categorical([labels[int(c)] for c in class_flat[mask]], categories=labels.values(), ordered=True)
-    })
-    return df
-
-def label_dict(intervals, fmt):
-    """Create label dictionary (1-based keys)."""
-    out = {}
-    for i, (low, high) in enumerate(intervals, 1):
-        if high is None:
-            out[i] = f">{low:g}"
-        else:
-            out[i] = f"{low:{fmt}}–{high:{fmt}}"
+        out = np.full(ref_shape, np.nan, dtype=np.float32)
+        reproject(
+            source=array,
+            destination=out,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            resampling=Resampling.bilinear,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+        )
     return out
 
-labels = {
-    "LAI": label_dict(lai_bins, ".1f"),
-    "CH": label_dict(ch_bins, ".0f"),
-    "Elevation (m)": label_dict(elev_bins, ".0f"),
-    "Precipitation (mm/mo)": label_dict(prep_bins, ".0f"),
-    "RSDS (W/m²)": label_dict(rsds_bins, ".0f"),
-    "VPD (kPa)": label_dict(vpd_bins, ".1f")
-}
 
-dfs = {
-    "LAI": create_df(diff_data, lai_class, labels["LAI"], "LAI"),
-    "CH": create_df(diff_data, ch_class, labels["CH"], "CH"),
-    "Elevation (m)": create_df(diff_data, elev_class, labels["Elevation (m)"], "Elevation (m)"),
-    "Precipitation (mm/mo)": create_df(diff_data, prep_class, labels["Precipitation (mm/mo)"], "Precipitation (mm/mo)"),
-    "RSDS (W/m²)": create_df(diff_data, rsds_class, labels["RSDS (W/m²)"], "RSDS (W/m²)"),
-    "VPD (kPa)": create_df(diff_data, vpd_class, labels["VPD (kPa)"], "VPD (kPa)")
-}
+def add_map_base(ax, extent, amazon_gdf, sites, label, title):
+    amazon_gdf.boundary.plot(ax=ax, color="#222222", linewidth=0.8)
 
-# =====================================================
-# 7. Remove outliers (2–98 percentile per class)
-# =====================================================
-def filter_by_percentile(df, group_col, value_col="ΔT (°C/year)", lower=0.02, upper=0.98):
-    """Remove outliers by percentile thresholds within each class."""
-    def _filt(g):
-        ql, qh = g[value_col].quantile([lower, upper])
-        return g[(g[value_col] >= ql) & (g[value_col] <= qh)]
-    return df.groupby(group_col, group_keys=False).apply(_filt).reset_index(drop=True)
+    lon = [v[0] for v in sites.values()]
+    lat = [v[1] for v in sites.values()]
+    ax.scatter(lon, lat, s=55, c="white", edgecolors="#222222", linewidths=0.8, zorder=5)
 
-for k in dfs:
-    dfs[k] = filter_by_percentile(dfs[k], k)
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_xticks([-80, -70, -60, -50])
+    ax.set_xticklabels(["80°W", "70°W", "60°W", "50°W"])
+    ax.set_yticks([-15, -10, -5, 0, 5])
+    ax.set_yticklabels(["15°S", "10°S", "5°S", "0°", "5°N"])
+    ax.tick_params(direction="in", length=3)
+    ax.text(0.02, 0.98, label, transform=ax.transAxes,
+            fontsize=39, fontweight="bold", va="top")
+    ax.set_title(title, fontsize=33, fontweight="bold", pad=4)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
 
-# =====================================================
-# 8. Plot boxplots (Fig. 1d–i)
-# =====================================================
-palettes = {
-    "LAI": sns.color_palette("Greens", 6),
-    "CH": sns.color_palette("BuGn", 6),
-    "Elevation (m)": sns.color_palette("YlOrBr", 6),
-    "Precipitation (mm/mo)": sns.color_palette("Blues", 6),
-    "RSDS (W/m²)": sns.color_palette("YlOrRd", 6),
-    "VPD (kPa)": sns.color_palette("Purples", 6)
-}
 
-fig, axes = plt.subplots(2, 3, figsize=(22, 10))
-axes = axes.flatten()
+def plot_rate_map(ax, array, extent, cmap, title, label, cbar_label, amazon_gdf, sites):
+    valid = array[np.isfinite(array)]
+    vmin, vmax = np.percentile(valid, [2, 98])
 
-for ax, (var, df) in zip(axes, dfs.items()):
-    sns.boxplot(
-        x=var,
-        y="ΔT (°C/year)",
-        data=df,
-        palette=palettes[var],
-        showfliers=False,
-        ax=ax
-    )
-    ax.set_title(var, fontsize=18)
-    ax.set_xlabel("")
-    ax.set_ylabel("ΔT (°C/year)", fontsize=15)
-    ax.tick_params(axis="x", rotation=30, labelsize=13)
-    ax.tick_params(axis="y", labelsize=13)
+    im = ax.imshow(array, cmap=cmap, vmin=vmin, vmax=vmax,
+                   extent=extent, origin="upper", aspect="auto", interpolation="nearest")
+    add_map_base(ax, extent, amazon_gdf, sites, label, title)
 
-plt.tight_layout()
-# plt.savefig("Figure1_d_i_DeltaT_vs_factors_ssp585.pdf", dpi=300)
-plt.show()
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("bottom", size="4%", pad=0.65)
+    cb = plt.colorbar(im, cax=cax, orientation="horizontal")
+    cb.set_label(cbar_label, fontsize=30, labelpad=10)
+    ticks = np.linspace(vmin, vmax, 5)
+    cb.set_ticks(ticks)
+    cb.set_ticklabels([f"{t:.2f}" for t in ticks])
+
+
+def plot_delta_map(ax, array, extent, title, label, amazon_gdf, sites):
+    abs_max = float(np.nanpercentile(np.abs(array), 98))
+    norm = TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
+
+    im = ax.imshow(array, cmap=CMAP_DELTA, norm=norm,
+                   extent=extent, origin="upper", aspect="auto", interpolation="nearest")
+    add_map_base(ax, extent, amazon_gdf, sites, label, title)
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("bottom", size="4%", pad=0.65)
+    cb = plt.colorbar(im, cax=cax, orientation="horizontal")
+    cb.set_label("ΔWR (°C/decade)", fontsize=30, labelpad=10)
+    ticks = np.linspace(-abs_max, abs_max, 5)
+    cb.set_ticks(ticks)
+    cb.set_ticklabels([f"{t:.2f}" for t in ticks])
+
+
+def plot_environment_boxes(axes, scenario, reference_raster):
+    """Plot ΔWR distributions across environmental gradients."""
+    fig_dir = CONFIG["fig1_dir"]
+    terrain_dir = CONFIG["terrain_dir"]
+    baseline_dir = CONFIG["baseline_dir"]
+
+    delta_path = fig_dir / f"Delta_WarmingRate_{scenario}_1983_2100.tif"
+    delta, _, _ = read_raster(delta_path)
+
+    factors = [
+        ("LAI", terrain_dir / "Historical_Aligned_LAI_Ele_2010s.tif",
+         [-np.inf, 2.5, 3.0, 3.5, 4.0, 4.5, np.inf],
+         ["<2.5", "2.5-3", "3-3.5", "3.5-4", "4-4.5", ">4.5"], "Greens", "d"),
+        ("Elevation (m)", terrain_dir / "Elev_m.tif",
+         [-np.inf, 20, 40, 60, 80, 100, np.inf],
+         ["<20", "20-40", "40-60", "60-80", "80-100", ">100"], "YlOrBr", "e"),
+        ("CH (m)", terrain_dir / "CanopyHeight_m.tif",
+         [-np.inf, 10, 15, 20, 25, 30, np.inf],
+         ["<10", "10-15", "15-20", "20-25", "25-30", ">30"], "BuGn", "f"),
+        ("Precipitation (mm/mo)", baseline_dir / "Historical_Average_Precipitation.tif",
+         [-np.inf, 140, 165, 190, 210, 240, np.inf],
+         ["<140", "140-165", "165-190", "190-210", "210-240", ">240"], "Blues", "g"),
+        ("VPD (kPa)", baseline_dir / "Historical_Average_VPD.tif",
+         [-np.inf, 0.35, 0.45, 0.55, 0.65, 0.80, np.inf],
+         ["<0.35", "0.35-0.45", "0.45-0.55", "0.55-0.65", "0.65-0.8", ">0.8"], "Purples", "h"),
+        ("RSDS (MJ/m²/day)", baseline_dir / "Historical_Average_RSDS.tif",
+         [-np.inf, 16.0, 16.5, 17.0, 17.5, 18.0, np.inf],
+         ["<16", "16-16.5", "16.5-17", "17-17.5", "17.5-18", ">18"], "YlOrRd", "i"),
+    ]
+
+    delta_filtered = delta.copy()
+    lo, hi = np.nanpercentile(delta_filtered, [2, 98])
+    delta_filtered[(delta_filtered < lo) | (delta_filtered > hi)] = np.nan
+
+    for ax, (title, raster_path, bins, labels, palette, panel) in zip(axes, factors):
+        factor = align_to_reference(raster_path, reference_raster)
+        valid = np.isfinite(factor) & np.isfinite(delta_filtered)
+        factor_values = factor[valid]
+        delta_values = delta_filtered[valid]
+
+        bin_index = np.digitize(factor_values, bins) - 1
+        bin_index = np.clip(bin_index, 0, len(labels) - 1)
+
+        groups = []
+        for i in range(len(labels)):
+            values = delta_values[bin_index == i]
+            if len(values) > 0:
+                p2, p98 = np.percentile(values, [2, 98])
+                values = values[(values >= p2) & (values <= p98)]
+            groups.append(values)
+
+        colors = sns.color_palette(palette, len(labels))
+        line_color = colors[-1]
+
+        bp = ax.boxplot(groups, patch_artist=True, showfliers=False, widths=0.55,
+                        medianprops=dict(color=line_color, linewidth=2.0),
+                        whiskerprops=dict(color=line_color, linewidth=1.0),
+                        capprops=dict(color=line_color, linewidth=1.0),
+                        boxprops=dict(color=line_color, linewidth=1.2))
+        for patch in bp["boxes"]:
+            patch.set_facecolor("white")
+
+        means = np.array([np.mean(g) if len(g) else np.nan for g in groups])
+        x = np.arange(1, len(labels) + 1)
+        ok = np.isfinite(means)
+        if ok.sum() >= 2:
+            slope, intercept, _, p_value, _ = stats.linregress(x[ok], means[ok])
+            ax.plot(x, slope * x + intercept, color=line_color,
+                    linewidth=2.0, linestyle="-" if p_value < 0.05 else "--")
+            p_text = "p<0.001" if p_value < 0.001 else f"p={p_value:.3f}"
+            ax.text(0.97, 0.96, p_text, transform=ax.transAxes,
+                    fontsize=27, ha="right", va="top", color=line_color)
+
+        ax.scatter(x[ok], means[ok], color=line_color, s=50, zorder=6)
+        ax.set_title(title, fontsize=33, pad=14)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=27)
+        ax.text(-0.10, 1.03, panel, transform=ax.transAxes,
+                fontsize=39, fontweight="bold", va="top")
+        ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        if panel in ("d", "g"):
+            ax.set_ylabel("ΔWR (°C/decade)", fontsize=30)
+
+
+# ---------------------------------------------------------------------
+# Main workflow
+# ---------------------------------------------------------------------
+
+def make_figure(scenario):
+    fig1_dir = CONFIG["fig1_dir"]
+    label = CONFIG["scenario_labels"][scenario]
+
+    micro_path = fig1_dir / f"Trend_Micro_Tmean_{scenario}_1983_2100.tif"
+    macro_path = fig1_dir / f"Trend_Macro_Tmean_Masked_{scenario}_1983_2100.tif"
+    delta_path = fig1_dir / f"Delta_WarmingRate_{scenario}_1983_2100.tif"
+
+    micro, micro_extent, _ = read_raster(micro_path)
+    macro, macro_extent, _ = read_raster(macro_path)
+    delta, delta_extent, _ = read_raster(delta_path)
+
+    amazon_gdf = gpd.read_file(CONFIG["shape_file"]).to_crs("EPSG:4326")
+
+    fig = plt.figure(figsize=(24, 22))
+    gs_top = gridspec.GridSpec(1, 3, figure=fig, wspace=0.28,
+                               top=0.96, bottom=0.53, left=0.05, right=0.97)
+    gs_bottom = gridspec.GridSpec(2, 3, figure=fig, hspace=0.62, wspace=0.35,
+                                  top=0.48, bottom=0.05, left=0.05, right=0.97)
+
+    ax_a = fig.add_subplot(gs_top[0, 0])
+    ax_b = fig.add_subplot(gs_top[0, 1])
+    ax_c = fig.add_subplot(gs_top[0, 2])
+    box_axes = [fig.add_subplot(gs_bottom[i, j]) for i in range(2) for j in range(3)]
+
+    plot_rate_map(ax_a, micro, micro_extent, CMAP_MICRO,
+                  f"WR$_{{micro}}$ — {label}", "a",
+                  "Warming rate (WR$_{micro}$, °C/decade)",
+                  amazon_gdf, CONFIG["sites"])
+    plot_rate_map(ax_b, macro, macro_extent, CMAP_MACRO,
+                  f"WR$_{{macro}}$ — {label}", "b",
+                  "Warming rate (WR$_{macro}$, °C/decade)",
+                  amazon_gdf, CONFIG["sites"])
+    plot_delta_map(ax_c, delta, delta_extent,
+                   f"ΔWR (WR$_{{macro}}$ − WR$_{{micro}}$) — {label}",
+                   "c", amazon_gdf, CONFIG["sites"])
+
+    plot_environment_boxes(box_axes, scenario, delta_path)
+
+    fig.text(0.5, 0.495,
+             "Differences in warming trends (ΔWR = WR$_{macro}$ − WR$_{micro}$) across environmental gradients",
+             ha="center", va="bottom", fontsize=27, color="#444444")
+
+    CONFIG["output_dir"].mkdir(parents=True, exist_ok=True)
+    out_pdf = CONFIG["output_dir"] / f"Fig1_{scenario.upper()}.pdf"
+    out_png = CONFIG["output_dir"] / f"Fig1_{scenario.upper()}.png"
+    fig.savefig(out_pdf, dpi=300, bbox_inches="tight")
+    fig.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out_pdf}")
+
+
+def main():
+    for scenario in CONFIG["scenarios"]:
+        make_figure(scenario)
+
+
+if __name__ == "__main__":
+    main()
