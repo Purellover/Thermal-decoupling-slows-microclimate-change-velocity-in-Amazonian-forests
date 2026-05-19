@@ -1,157 +1,213 @@
+#!/usr/bin/env python3
 """
-Figure 3 – Hotspot velocity roses and dominant direction analysis
+Figure 3. Climate change velocity maps and hotspot rose diagrams.
 
-This script generates velocity rose diagrams and a summary of dominant
-movement directions for climate-change velocity hotspots.
+Workflow
+1. Read microclimate and macroclimate velocity rasters.
+2. Read hotspot polygons.
+3. Insert precomputed rose diagrams for each hotspot.
+4. Export one figure for each emissions scenario.
 
-Inputs:
-    - hotspot shapefile (e.g. "Figure3_data/hotspots.shp")
-    - velocity direction raster (degrees, e.g. "Figure3_data/Tmacro_direction_10km.tif")
-    - velocity magnitude raster (km per decade, e.g. "Figure3_data/Tmacro_velocity_ssp245_10km.tif")
-
-Outputs:
-    - individual rose diagrams (PDF)
-    - summary table of dominant directions (CSV)
+This script assumes that the hotspot rose diagrams have already been generated as PDF files.
+Update the paths in CONFIG before running.
 """
 
+from pathlib import Path
+import warnings
 
-import os
-import numpy as np
-import pandas as pd
-import rasterio
 import geopandas as gpd
-from rasterio.mask import mask
-from rasterio import features
-from shapely.geometry import mapping
+import matplotlib.colors as mcolors
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
+import numpy as np
+import rasterio
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Ellipse
 
-# =====================================================
-# 1. File paths (relative to repository root)
-# =====================================================
-hotspot_shp = "Figure3_data/hotspots.shp"
-dir_raster  = "Figure3_data/Tmacro_direction_10km.tif"
-vel_raster  = "Figure3_data/Tmacro_velocity_ssp245_10km.tif"
-output_dir  = "outputs/Fig3_velocity_roses/"
-os.makedirs(output_dir, exist_ok=True)
+warnings.filterwarnings("ignore")
 
-# =====================================================
-# 2. Custom color map (velocity magnitude scale)
-# =====================================================
-custom_colors = [
-    '#2c7c9f', '#66c2a5', '#c7e9b4', '#ffffcc',
-    '#ffeda0', '#feb24c', '#fc4e2a', '#e31a1c', '#bd0026'
-]
-cmap = ListedColormap(custom_colors)
-boundaries = np.arange(1, 10 + 1, 1)
-norm = BoundaryNorm(boundaries, cmap.N)
 
-plt.rcParams['font.family'] = 'DejaVu Sans'
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-# =====================================================
-# 3. Polar rose plotting function
-# =====================================================
-def plot_rose_count_colored_by_velocity(direction, magnitude, bins=16, title=""):
-    """Plot a rose diagram showing pixel count per direction, colored by mean velocity."""
-    mask = (~np.isnan(direction)) & (~np.isnan(magnitude))
-    theta = np.deg2rad(direction[mask])
-    values = magnitude[mask]
+CONFIG = {
+    "base_dir": Path(r"E:/Paper_2_new"),
+    "fig3_dir": Path(r"E:/Paper_2_new/Fig_3"),
+    "shape_file": Path(r"E:/Paper_2_new/shp/amazon_bio.shp"),
+    "hotspot_file": Path(r"E:/Paper_2_new/shp/hotpoint.shp"),
+    "output_dir": Path(r"E:/Paper_2_new/Fig_3"),
+    "scenarios": ["ssp245", "ssp585"],
+    "scenario_labels": {"ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"},
+    "velocity_min": 0,
+    "velocity_max": 10,
+}
 
-    counts, bin_edges = np.histogram(theta, bins=bins)
-    total_vel, _ = np.histogram(theta, bins=bin_edges, weights=values)
-    avg_vel = total_vel / (counts + 1e-6)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    colors = cmap(norm(avg_vel))
+CMAP_VELOCITY = LinearSegmentedColormap.from_list(
+    "velocity", ["#4575b4", "#74add1", "#abd9e9", "#e0f3f8",
+                 "#ffffbf", "#fee090", "#fdae61", "#f46d43",
+                 "#d73027", "#a50026"], N=256
+)
+HOTSPOT_COLORS = ["#2166ac", "#762a83", "#1b7837", "#b2182b"]
 
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={'polar': True})
-    ax.bar(bin_centers, counts, width=(2*np.pi)/bins, color=colors, edgecolor='black', alpha=0.9)
-    ax.set_theta_zero_location('N')
-    ax.set_theta_direction(-1)
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 30,
+    "axes.linewidth": 1.0,
+})
 
-    r = ax.get_rmax() + 1
-    for angle, label in zip([0, np.pi/2, np.pi, 3*np.pi/2], ['N', 'W', 'S', 'E']):
-        ax.text(angle, r, label, ha='center', va='center', fontsize=14, fontweight='bold')
 
-    ax.set_title(title, va='bottom', fontsize=16)
-    return fig, ax
+# ---------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------
 
-# =====================================================
-# 4. Load hotspot polygons and rasters
-# =====================================================
-gdf = gpd.read_file(hotspot_shp)
-with rasterio.open(dir_raster) as dir_src, rasterio.open(vel_raster) as vel_src:
-    for idx, row in gdf.iterrows():
-        geometry = [row.geometry]
-        out_dir, _ = mask(dir_src, geometry, crop=True)
-        out_vel, _ = mask(vel_src, geometry, crop=True)
-        dir_data = out_dir[0].astype(float)
-        vel_data = out_vel[0].astype(float)
+def read_raster(path):
+    with rasterio.open(path) as src:
+        array = src.read(1).astype(np.float32)
+        nodata = src.nodata
+        extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
+    if nodata is not None:
+        array[array == nodata] = np.nan
+    array[array <= -9990] = np.nan
+    return array, extent
 
-        fig, ax = plot_rose_count_colored_by_velocity(
-            direction=dir_data,
-            magnitude=vel_data,
-            bins=16,
-            title=f"Hotspot {idx+1}"
-        )
 
-        fig.savefig(
-            os.path.join(output_dir, f"rose_hotspot_{idx+1}.pdf"),
-            dpi=300, bbox_inches='tight', format='pdf'
-        )
-        plt.close(fig)
+def pdf_to_array(pdf_path):
+    """Convert the first page of a PDF rose diagram to a NumPy image array."""
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        doc.close()
+        return image[:, :, :3] if image.shape[2] == 4 else image
+    except Exception:
+        return None
 
-print(f"✅ Rose diagrams saved to: {output_dir}")
 
-# =====================================================
-# 5. Dominant direction extraction
-# =====================================================
-def extract_dir_vel(geom, direction_data, velocity_data, transform):
-    """Extract all pixel values of direction and velocity within a geometry."""
-    mask = features.geometry_mask([mapping(geom)], direction_data.shape, transform, invert=True)
-    return direction_data[mask], velocity_data[mask]
+def draw_velocity_map(ax, array, extent, amazon_gdf, hotspot_gdf, label, title):
+    im = ax.imshow(array, cmap=CMAP_VELOCITY,
+                   vmin=CONFIG["velocity_min"], vmax=CONFIG["velocity_max"],
+                   extent=extent, origin="upper", aspect="auto", interpolation="nearest")
+    amazon_gdf.boundary.plot(ax=ax, color="#111111", linewidth=1.0)
 
-def get_main_direction_info(direction, velocity, bins=16):
-    """Return dominant direction range, center, pixel count, and mean velocity."""
-    mask = (~np.isnan(direction)) & (~np.isnan(velocity))
-    if mask.sum() == 0:
-        return {"main_direction_range": np.nan, "main_direction_center": np.nan,
-                "pixel_count": 0, "avg_velocity_km_decade": np.nan}
-    direction = direction[mask]
-    velocity = velocity[mask]
+    x_range = extent[1] - extent[0]
+    y_range = extent[3] - extent[2]
+    fig = ax.get_figure()
+    bbox = ax.get_position()
+    ax_width = fig.get_size_inches()[0] * bbox.width
+    ax_height = fig.get_size_inches()[1] * bbox.height
+    radius_screen_inches = 0.60
+    radius_x = radius_screen_inches / (ax_width / x_range)
+    radius_y = radius_screen_inches / (ax_height / y_range)
 
-    theta = np.deg2rad(direction)
-    counts, bin_edges = np.histogram(theta, bins=bins)
-    total_velocity, _ = np.histogram(theta, bins=bin_edges, weights=velocity)
-    avg_velocity = total_velocity / (counts + 1e-6)
+    for i, (_, row) in enumerate(hotspot_gdf.iterrows()):
+        lon = row.geometry.centroid.x
+        lat = row.geometry.centroid.y
+        color = HOTSPOT_COLORS[i]
 
-    main_idx = np.argmax(counts)
-    bin_start, bin_end = np.rad2deg(bin_edges[main_idx]), np.rad2deg(bin_edges[main_idx+1])
-    bin_center = (bin_start + bin_end) / 2
+        ax.add_patch(Ellipse((lon, lat), 2 * radius_x, 2 * radius_y,
+                             fill=False, edgecolor=color, linewidth=4.5,
+                             linestyle="--", transform=ax.transData, zorder=5))
+        ax.add_patch(Ellipse((lon, lat), 0.6 * radius_x, 0.6 * radius_y,
+                             facecolor=color, edgecolor="white", linewidth=1.0,
+                             transform=ax.transData, zorder=7))
+        ax.text(lon, lat, str(i + 1), ha="center", va="center",
+                fontsize=30, fontweight="bold", color="white", zorder=8)
 
-    return {
-        "main_direction_range": f"{bin_start:.1f}°–{bin_end:.1f}°",
-        "main_direction_center": round(bin_center, 1),
-        "pixel_count": int(counts[main_idx]),
-        "avg_velocity_km_decade": round(float(avg_velocity[main_idx]), 3)
-    }
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=42, fontweight="bold", va="top")
+    ax.set_title(title, fontsize=33, fontweight="normal", pad=6)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    return im
 
-# =====================================================
-# 6. Compute dominant direction per hotspot
-# =====================================================
-results = []
-with rasterio.open(dir_raster) as dir_src, rasterio.open(vel_raster) as vel_src:
-    direction_data = dir_src.read(1)
-    velocity_data = vel_src.read(1)
-    transform = dir_src.transform
-    crs = dir_src.crs
 
-    gdf = gdf.to_crs(crs)
-    for idx, row in gdf.iterrows():
-        dir_vals, vel_vals = extract_dir_vel(row.geometry, direction_data, velocity_data, transform)
-        info = get_main_direction_info(dir_vals, vel_vals)
-        info["hotspot_id"] = idx + 1
-        results.append(info)
+def draw_rose_row(axes, images, prefix):
+    for i, (ax, image) in enumerate(zip(axes, images)):
+        color = HOTSPOT_COLORS[i]
+        if image is not None:
+            ax.imshow(image, aspect="auto")
+        else:
+            ax.text(0.5, 0.5, f"Hotspot {i + 1}", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=18)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(2.5)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(f"{prefix}{i + 1}", fontsize=27, color=color, fontweight="normal", pad=5)
 
-df_results = pd.DataFrame(results)
-df_results.to_csv(os.path.join(output_dir, "dominant_direction_summary.csv"), index=False)
-print("✅ Dominant direction summary saved.")
+
+def make_figure(scenario):
+    fig3_dir = CONFIG["fig3_dir"]
+    label = CONFIG["scenario_labels"][scenario]
+
+    micro_path = fig3_dir / scenario / "10km" / f"climate_velocity_{scenario}_10km.tif"
+    macro_path = fig3_dir / "macro" / scenario / "10km" / f"climate_velocity_{scenario}_10km.tif"
+
+    micro, micro_extent = read_raster(micro_path)
+    macro, macro_extent = read_raster(macro_path)
+
+    amazon_gdf = gpd.read_file(CONFIG["shape_file"]).to_crs("EPSG:4326")
+    hotspot_gdf = gpd.read_file(CONFIG["hotspot_file"]).to_crs("EPSG:4326")
+
+    rose_dir = fig3_dir / "rose_hotspot" / scenario
+    rose_micro, rose_macro = [], []
+    for i in range(1, 5):
+        rose_micro.append(pdf_to_array(rose_dir / f"rose_micro_hotspot{i}_Hotspot_{i}_{scenario}.pdf"))
+        rose_macro.append(pdf_to_array(rose_dir / f"rose_macro_hotspot{i}_Hotspot_{i}_{scenario}.pdf"))
+
+    fig = plt.figure(figsize=(22, 22))
+    gs = gridspec.GridSpec(3, 1, figure=fig, hspace=0.04,
+                           top=0.97, bottom=0.05, left=0.04, right=0.97,
+                           height_ratios=[1.0, 1.8, 1.0])
+
+    gs_top = gridspec.GridSpecFromSubplotSpec(1, 4, subplot_spec=gs[0], wspace=0.10)
+    gs_map = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[1], wspace=0.04)
+    gs_bottom = gridspec.GridSpecFromSubplotSpec(1, 4, subplot_spec=gs[2], wspace=0.10)
+
+    axes_micro_rose = [fig.add_subplot(gs_top[0, i]) for i in range(4)]
+    ax_micro = fig.add_subplot(gs_map[0, 0])
+    ax_macro = fig.add_subplot(gs_map[0, 1])
+    axes_macro_rose = [fig.add_subplot(gs_bottom[0, i]) for i in range(4)]
+
+    draw_rose_row(axes_micro_rose, rose_micro, "a")
+    draw_rose_row(axes_macro_rose, rose_macro, "b")
+
+    draw_velocity_map(ax_micro, micro, micro_extent, amazon_gdf, hotspot_gdf,
+                      "a", f"Microclimate — {label}")
+    draw_velocity_map(ax_macro, macro, macro_extent, amazon_gdf, hotspot_gdf,
+                      "b", f"Macroclimate — {label}")
+
+    cbar_ax = fig.add_axes([0.18, 0.015, 0.64, 0.018])
+    sm = plt.cm.ScalarMappable(
+        cmap=CMAP_VELOCITY,
+        norm=mcolors.Normalize(vmin=CONFIG["velocity_min"], vmax=CONFIG["velocity_max"]),
+    )
+    cb = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal")
+    cb.set_label("Climate Change Velocity (km/yr)", fontsize=33, labelpad=6)
+    cb.ax.tick_params(labelsize=26)
+    cb.set_ticks(np.arange(CONFIG["velocity_min"], CONFIG["velocity_max"] + 1, 1))
+
+    CONFIG["output_dir"].mkdir(parents=True, exist_ok=True)
+    out_pdf = CONFIG["output_dir"] / f"Fig3_{scenario.upper()}.pdf"
+    out_png = CONFIG["output_dir"] / f"Fig3_{scenario.upper()}.png"
+    fig.savefig(out_pdf, dpi=300, bbox_inches="tight")
+    fig.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out_pdf}")
+
+
+def main():
+    for scenario in CONFIG["scenarios"]:
+        make_figure(scenario)
+
+
+if __name__ == "__main__":
+    main()
