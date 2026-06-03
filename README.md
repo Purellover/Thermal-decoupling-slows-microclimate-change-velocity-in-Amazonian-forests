@@ -42,6 +42,8 @@ repository/
 
 `scripts/make_figure4_refugia_protection.py` generates refugia maps, climate residence time, area and patch-count summaries, and a supplementary protected-area gap figure.
 
+Merged_Data.csv is the prepared model training table containing matched monthly microclimate observations and predictor variables. The original microclimate logger data are not distributed in this repository because of field-site data sharing agreements, but they are available from the corresponding author upon reasonable request.
+
 ## System requirements
 
 The scripts were developed and tested with Python 3.10 on a Windows desktop environment. They should also run on Linux or macOS provided that the required geospatial Python libraries are correctly installed.
