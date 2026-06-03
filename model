@@ -55,8 +55,11 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # =============================================================================
 
-INPUT_CSV = Path("Merged_Data_Daily_Radiation.csv")
-OUTPUT_DIR = Path("model_outputs")
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_DIR / "data"
+OUTPUT_DIR = PROJECT_DIR / "outputs" / "model_outputs"
+
+INPUT_CSV = DATA_DIR / "model_input" / "Merged_Data.csv"
 
 GROUP_COLUMN = "ID"
 RANDOM_STATE = 42
