@@ -10,7 +10,10 @@ The scripts assume that the required public climate, vegetation, topographic and
 repository/
 ├── data/
 │   ├── model_input/
-│   │   └── Merged_Data.csv
+│   │   └── Merged_Data_Daily_Radiation.csv
+│   ├── velocity_inputs/
+│   │   ├── mean_temperature_baseline.tif
+│   │   └── decadal_mean_temperature/
 │   ├── shapefiles/
 │   │   ├── amazon_bio.shp
 │   │   └── hotpoint.shp
@@ -23,6 +26,12 @@ repository/
 │   ├── prediction_annual_mean_tmax/
 │   └── prediction_annual_mean_tmin/
 ├── scripts/
+│   ├── train_microclimate_xgboost_models.py
+│   ├── calculate_climate_velocity.py
+│   ├── make_figure1_warming_decoupling.py
+│   ├── make_figure2_microclimate_regimes.py
+│   ├── make_figure3_climate_velocity.py
+│   └── make_figure4_refugia_protection.py
 ├── outputs/
 ├── requirements.txt
 └── README.md
